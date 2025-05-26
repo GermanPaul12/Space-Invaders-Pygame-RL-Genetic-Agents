@@ -8,10 +8,8 @@ from torch.distributions import Categorical
 from .agent import Agent
 from .dqn_agent import preprocess_observation # Reuse preprocessing
 
-# Re-use ActorCriticNetwork from A2C if the structure is similar
-# For PPO, the actor usually outputs logits for Categorical distribution.
 class PPOActorCriticNetwork(nn.Module):
-    def __init__(self, input_channels, num_actions, h=84, w=84):
+    def __init__(self, input_channels, num_actions, h=84, w=84): # h,w are target preprocessed dimensions
         super(PPOActorCriticNetwork, self).__init__()
         self.conv1 = nn.Conv2d(input_channels, 32, kernel_size=8, stride=4)
         self.conv2 = nn.Conv2d(32, 64, kernel_size=4, stride=2)
@@ -43,17 +41,22 @@ class PPOActorCriticNetwork(nn.Module):
 
 
 class PPOAgent(Agent):
-    def __init__(self, action_size, observation_shape, # (C, H, W)
+    def __init__(self, action_size, observation_shape, # (C, H, W) e.g. (1, 84, 84)
                  lr=2.5e-4, gamma=0.99, gae_lambda=0.95,
                  ppo_clip=0.2, ppo_epochs=4, mini_batch_size=32,
                  entropy_coef=0.01, value_loss_coef=0.5,
-                 trajectory_n_steps=128): # Steps to collect before update
+                 trajectory_n_steps=128):
         super().__init__(action_size, observation_shape)
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         print(f"PPO Agent using device: {self.device}")
 
-        self.input_channels = observation_shape[0] if observation_shape else 1
-        self.network = PPOActorCriticNetwork(self.input_channels, action_size).to(self.device)
+        self.input_channels = observation_shape[0]
+        self.processed_h = observation_shape[1]
+        self.processed_w = observation_shape[2]
+
+        self.network = PPOActorCriticNetwork(
+            self.input_channels, action_size, h=self.processed_h, w=self.processed_w
+        ).to(self.device)
         self.optimizer = optim.Adam(self.network.parameters(), lr=lr, eps=1e-5)
         
         self.gamma = gamma
@@ -65,21 +68,22 @@ class PPOAgent(Agent):
         self.value_loss_coef = value_loss_coef
         self.trajectory_n_steps = trajectory_n_steps
 
-        # Trajectory buffer
+        # Trajectory buffer stores preprocessed numpy arrays for states
         self.buffer = {
             'states': [], 'actions': [], 'log_probs': [],
             'rewards': [], 'dones': [], 'values': []
         }
         self.current_buffer_size = 0
+        self._temp_action_data = {} # To hold data between choose_action and store_transition_outcome
 
     def _clear_buffer(self):
         for k in self.buffer:
             self.buffer[k] = []
         self.current_buffer_size = 0
 
-    def choose_action(self, observation): # observation is raw
-        state_p = preprocess_observation(observation)
-        state_tensor = torch.from_numpy(state_p).float().unsqueeze(0).to(self.device)
+    def choose_action(self, raw_observation):
+        state_p_np = preprocess_observation(raw_observation, new_size=(self.processed_h, self.processed_w))
+        state_tensor = torch.from_numpy(state_p_np).float().unsqueeze(0).to(self.device)
         
         with torch.no_grad():
             action_logits, state_value = self.network(state_tensor)
@@ -88,17 +92,15 @@ class PPOAgent(Agent):
         action = m.sample()
         log_prob = m.log_prob(action)
         
-        # Store for trajectory (will be added to buffer later)
         self._temp_action_data = {
-            'state': state_p, # Store preprocessed state
+            'state': state_p_np, # Store preprocessed numpy state
             'action': action.item(),
             'log_prob': log_prob.item(),
             'value': state_value.item()
         }
         return action.item()
 
-    def store_transition_outcome(self, reward, done, next_observation):
-        # Add previous step's data along with current outcome
+    def store_transition_outcome(self, reward, done, raw_next_observation):
         self.buffer['states'].append(self._temp_action_data['state'])
         self.buffer['actions'].append(self._temp_action_data['action'])
         self.buffer['log_probs'].append(self._temp_action_data['log_prob'])
@@ -107,19 +109,17 @@ class PPOAgent(Agent):
         self.buffer['dones'].append(done)
         self.current_buffer_size += 1
 
-        # If trajectory is full, or game is done, trigger learning
         if self.current_buffer_size >= self.trajectory_n_steps or done:
-            # Need the value of the 'next_observation' to calculate GAE for the last step
             last_value = 0
-            if not done and next_observation is not None: # Bootstrap if not terminal
-                next_state_p = preprocess_observation(next_observation)
-                next_state_tensor = torch.from_numpy(next_state_p).float().unsqueeze(0).to(self.device)
+            if not done and raw_next_observation is not None:
+                next_state_p_np = preprocess_observation(raw_next_observation, new_size=(self.processed_h, self.processed_w))
+                next_state_tensor = torch.from_numpy(next_state_p_np).float().unsqueeze(0).to(self.device)
                 with torch.no_grad():
                     _, last_val_tensor = self.network(next_state_tensor)
                 last_value = last_val_tensor.item()
             
             loss = self.learn(last_value)
-            self._clear_buffer() # Ready for new trajectory
+            self._clear_buffer()
             return loss
         return None
 
@@ -127,37 +127,57 @@ class PPOAgent(Agent):
     def _compute_gae(self, rewards, values, dones, last_value):
         advantages = np.zeros_like(rewards, dtype=np.float32)
         gae = 0
-        # values include V(s_0)...V(s_{T-1}). last_value is V(s_T)
-        # For loop from T-1 down to 0
+        # values from buffer are V(s_0)...V(s_{T-1}). last_value is V(s_T) or 0 if s_T is terminal
+        # Ensure values array is extended with last_value for calculation if needed,
+        # or handle boundary condition in loop carefully.
+        # For a trajectory of length T, rewards has T items, values has T items.
+        # dones has T items.
+        
+        # Corrected GAE calculation:
+        # We have V(s_0), ..., V(s_{T-1}) in `values`
+        # `last_value` is V(s_T) if s_T is not terminal, else 0.
+        
+        # If the trajectory ends because it's 'done', then V(s_T) effectively is 0 for GAE computation.
+        # If it ends because trajectory_n_steps is reached, then V(s_T) is bootstrapped.
+        
         for t in reversed(range(len(rewards))):
-            delta = rewards[t] + self.gamma * (1 - dones[t]) * (values[t+1] if t+1 < len(values) else last_value) - values[t]
+            if t == len(rewards) - 1: # Last step in the collected trajectory
+                next_val = last_value # This is V(s_T)
+            else:
+                next_val = values[t+1] # This is V(s_{t+1})
+
+            delta = rewards[t] + self.gamma * (1 - dones[t]) * next_val - values[t]
             gae = delta + self.gamma * self.gae_lambda * (1 - dones[t]) * gae
             advantages[t] = gae
-        returns = advantages + values[:len(rewards)] # Gt = At + V(st)
+        
+        returns = advantages + values[:len(rewards)]
         return advantages, returns
 
     def learn(self, last_value):
-        # Prepare data from buffer
-        states = torch.from_numpy(np.array(self.buffer['states'])).float().to(self.device)
-        actions = torch.tensor(self.buffer['actions'], device=self.device).long()
-        old_log_probs = torch.tensor(self.buffer['log_probs'], device=self.device).float()
-        rewards = np.array(self.buffer['rewards'])
-        dones = np.array(self.buffer['dones'])
-        values = np.array(self.buffer['values'])
+        # Buffer 'states' contains list of preprocessed numpy arrays
+        states_np = np.stack(self.buffer['states'])
+        states = torch.from_numpy(states_np).float().to(self.device)
+        
+        actions = torch.tensor(self.buffer['actions'], device=self.device, dtype=torch.long)
+        old_log_probs = torch.tensor(self.buffer['log_probs'], device=self.device, dtype=torch.float)
+        
+        # Convert lists from buffer to numpy arrays for GAE calculation
+        rewards_np = np.array(self.buffer['rewards'], dtype=np.float32)
+        dones_np = np.array(self.buffer['dones'], dtype=np.bool_) # Ensure boolean
+        values_np = np.array(self.buffer['values'], dtype=np.float32)
 
-        advantages, returns = self._compute_gae(rewards, values, dones, last_value)
-        advantages = torch.from_numpy(advantages).float().to(self.device)
-        returns = torch.from_numpy(returns).float().to(self.device)
+        advantages_np, returns_np = self._compute_gae(rewards_np, values_np, dones_np, last_value)
+        
+        advantages = torch.from_numpy(advantages_np).float().to(self.device)
+        returns = torch.from_numpy(returns_np).float().to(self.device)
 
-        # Normalize advantages (optional but often good)
         advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
 
         total_loss_val = 0
+        num_minibatches = 0
         
-        # PPO update epochs
         for _ in range(self.ppo_epochs):
-            # Create minibatches
-            num_samples = len(states)
+            num_samples = len(states) # or self.current_buffer_size
             indices = np.arange(num_samples)
             np.random.shuffle(indices)
             
@@ -171,33 +191,29 @@ class PPOAgent(Agent):
                 mb_advantages = advantages[mb_indices]
                 mb_returns = returns[mb_indices]
 
-                # Get current policy predictions for these states
                 new_action_logits, new_values = self.network(mb_states)
                 m = Categorical(logits=new_action_logits)
                 new_log_probs = m.log_prob(mb_actions)
                 entropy = m.entropy().mean()
-                new_values = new_values.squeeze()
+                new_values = new_values.squeeze(-1) # Ensure (batch_size,)
 
-
-                # Policy (Actor) loss
                 ratio = torch.exp(new_log_probs - mb_old_log_probs)
                 surr1 = ratio * mb_advantages
                 surr2 = torch.clamp(ratio, 1.0 - self.ppo_clip, 1.0 + self.ppo_clip) * mb_advantages
                 actor_loss = -torch.min(surr1, surr2).mean()
 
-                # Value (Critic) loss
                 critic_loss = F.mse_loss(new_values, mb_returns)
                 
-                # Total loss
                 loss = actor_loss + self.value_loss_coef * critic_loss - self.entropy_coef * entropy
-                total_loss_val += loss.item() # Accumulate for logging
+                total_loss_val += loss.item()
+                num_minibatches += 1
 
                 self.optimizer.zero_grad()
                 loss.backward()
-                torch.nn.utils.clip_grad_norm_(self.network.parameters(), 0.5) # Clip gradients
+                torch.nn.utils.clip_grad_norm_(self.network.parameters(), 0.5)
                 self.optimizer.step()
         
-        return total_loss_val / (self.ppo_epochs * (num_samples // self.mini_batch_size))
+        return total_loss_val / num_minibatches if num_minibatches > 0 else 0
 
 
     def save(self, path):

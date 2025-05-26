@@ -8,10 +8,29 @@ import config # Import all configurations
 # Initialize Pygame's font and mixer modules (mixer pre_init handled in Game)
 pg.font.init()
 
-# Load Images (global for access by sprite classes)
-# convert_alpha() is good for images with transparency.
-IMAGES = {name: pg.image.load(config.IMAGE_PATH + '{}.png'.format(name)).convert_alpha()
-          for name in config.IMG_NAMES}
+# Global dictionary for images, to be populated after pygame display is initialized
+IMAGES = {}
+
+def load_all_game_images():
+    """Loads all game images into the global IMAGES dictionary."""
+    global IMAGES # Ensure we are modifying the global IMAGES variable
+    # convert_alpha() is good for images with transparency.
+    for name in config.IMG_NAMES:
+        try:
+            image_path = config.IMAGE_PATH + '{}.png'.format(name)
+            IMAGES[name] = pg.image.load(image_path).convert_alpha()
+        except pg.error as e:
+            print(f"Error loading image '{image_path}': {e}")
+            # Create a placeholder surface if an image fails to load
+            IMAGES[name] = pg.Surface((30, 30))
+            IMAGES[name].fill(config.RED) # Fill with a noticeable color like red
+            rect = IMAGES[name].get_rect()
+            # Optionally draw the name on the placeholder
+            font = pg.font.Font(None, 12) # Use default font
+            text_surf = font.render(name[:4], True, config.WHITE) # Show first 4 chars of name
+            text_rect = text_surf.get_rect(center=rect.center)
+            IMAGES[name].blit(text_surf, text_rect)
+
 
 class Ship(pg.sprite.Sprite):
     def __init__(self):
@@ -206,25 +225,35 @@ class Blocker(pg.sprite.Sprite):
 
 
 class Mystery(pg.sprite.Sprite):
-    def __init__(self):
+    def __init__(self, sound_manager): # Pass the game's sound manager (or just the specific sound)
         pg.sprite.Sprite.__init__(self)
         self.image = IMAGES['mystery']
         self.image = pg.transform.scale(self.image, (75, 35))
         self.rect = self.image.get_rect(topleft=(-80, config.MYSTERY_SHIP_START_Y))
-        self.row = 5  # Special row index for scoring
+        self.row = 5
         self.moveTime = config.MYSTERY_SHIP_MOVE_TIME
         self.direction = 1
         self.timer = pg.time.get_ticks()
-        self.mysteryEnteredSound = pg.mixer.Sound(config.SOUND_PATH + 'mysteryentered.wav')
-        self.mysteryEnteredSound.set_volume(0.3)
+        
+        # Get the sound from the sound_manager passed by Game instance
+        # sound_manager would be self.sounds from the Game class
+        self.mysteryEnteredSound = sound_manager.get('mysteryentered')
+        if self.mysteryEnteredSound is None: # Fallback if key is missing
+            class DummySound:
+                def play(self, *args, **kwargs): pass
+                def stop(self, *args, **kwargs): pass
+                def fadeout(self, *args, **kwargs): pass
+                def set_volume(self, *args, **kwargs): pass
+            self.mysteryEnteredSound = DummySound()
+
         self.playSound = True
 
     def update(self, keys, currentTime, screen_surface): # Added screen_surface (keys not used)
         resetTimer = False
         passed = currentTime - self.timer
         if passed > self.moveTime:
-            if (self.rect.x < 0 or self.rect.x > config.SCREEN_WIDTH) and self.playSound: # Use config
-                self.mysteryEnteredSound.play()
+            if (self.rect.x < 0 or self.rect.x > config.SCREEN_WIDTH) and self.playSound:
+                if self.mysteryEnteredSound: self.mysteryEnteredSound.play() # Check if sound exists
                 self.playSound = False
             
             # Move logic
@@ -359,13 +388,35 @@ class Text(object): # Not a sprite, a helper for rendering text
 
 
 class Game:
-    def __init__(self):
-        pg.mixer.pre_init(44100, -16, 1, 4096) # As in original
+    def __init__(self, silent_mode=False): # <--- Added silent_mode parameter
+        self.silent_mode = silent_mode       # <--- Store it
+
+        if not self.silent_mode:
+            pg.mixer.pre_init(44100, -16, 1, 4096)
+        else: # For silent mode, we might not need mixer at all, or a dummy one
+            try:
+                # Try to init mixer anyway, but we won't load/play sounds
+                # This can prevent errors if some part of Pygame expects mixer to be init.
+                # Or, consider pg.mixer.quit() if it was somehow init before.
+                pg.mixer.init(frequency=22050, size=-16, channels=2, buffer=512) # Minimal init
+            except pg.error:
+                print("Mixer could not be initialized in silent mode (this is usually fine).")
+
+
         pg.init() # Initialize all pygame modules
-        self.clock = pg.time.Clock()
-        pg.display.set_caption('Space Invaders')
+        
         self.screen = pg.display.set_mode((config.SCREEN_WIDTH, config.SCREEN_HEIGHT))
-        self.background = pg.image.load(config.IMAGE_PATH + 'background.jpg').convert()
+        pg.display.set_caption('Space Invaders')
+
+        load_all_game_images()
+
+        self.clock = pg.time.Clock()
+        try:
+            self.background = pg.image.load(config.IMAGE_PATH + 'background.jpg').convert()
+        except pg.error as e:
+            print(f"Warning: Could not load background image: {e}")
+            self.background = pg.Surface((config.SCREEN_WIDTH, config.SCREEN_HEIGHT))
+            self.background.fill((0,0,0)) # Black background
         
         # Game state variables
         self.mainScreenActive = True # Start with main menu
@@ -421,14 +472,44 @@ class Game:
 
     def _create_audio_assets(self):
         self.sounds = {}
-        for sound_name in ['shoot', 'shoot2', 'invaderkilled', 'mysterykilled', 'shipexplosion']:
-            self.sounds[sound_name] = pg.mixer.Sound(config.SOUND_PATH + '{}.wav'.format(sound_name))
-            self.sounds[sound_name].set_volume(0.2)
-
-        self.musicNotes = [pg.mixer.Sound(config.SOUND_PATH + '{}.wav'.format(i)) for i in range(4)]
-        for sound in self.musicNotes:
-            sound.set_volume(0.5)
+        self.musicNotes = []
         self.noteIndex = 0
+
+        if self.silent_mode:
+            # Create dummy sound objects that do nothing if called
+            class DummySound:
+                def play(self, *args, **kwargs): pass
+                def stop(self, *args, **kwargs): pass
+                def fadeout(self, *args, **kwargs): pass
+                def set_volume(self, *args, **kwargs): pass
+
+            for sound_name in ['shoot', 'shoot2', 'invaderkilled', 'mysterykilled', 'shipexplosion', 'mysteryentered']:
+                self.sounds[sound_name] = DummySound()
+            for i in range(4):
+                self.musicNotes.append(DummySound())
+            
+            # Mystery ship has its own sound instance, handle it too
+            if hasattr(self, 'mysteryShip') and self.mysteryShip:
+                 self.mysteryShip.mysteryEnteredSound = DummySound()
+
+            return
+
+        # Original sound loading
+        for sound_name in ['shoot', 'shoot2', 'invaderkilled', 'mysterykilled', 'shipexplosion']:
+            try:
+                self.sounds[sound_name] = pg.mixer.Sound(config.SOUND_PATH + '{}.wav'.format(sound_name))
+                self.sounds[sound_name].set_volume(0.2)
+            except pg.error as e:
+                print(f"Warning: Could not load sound '{sound_name}': {e}")
+                self.sounds[sound_name] = DummySound() # Fallback to dummy
+
+        try:
+            self.musicNotes = [pg.mixer.Sound(config.SOUND_PATH + '{}.wav'.format(i)) for i in range(4)]
+            for sound in self.musicNotes:
+                sound.set_volume(0.5)
+        except pg.error as e:
+            print(f"Warning: Could not load music notes: {e}")
+            self.musicNotes = [DummySound() for _ in range(4)] # Fallback
 
     def _full_game_reset(self, start_score=0, start_lives=3):
         self.score = start_score
@@ -457,7 +538,7 @@ class Game:
         self.player = Ship()
         self.playerGroup.add(self.player)
         
-        self.mysteryShip = Mystery()
+        self.mysteryShip = Mystery(sound_manager=self.sounds)
         self.mysteryGroup.add(self.mysteryShip)
         
         self._make_enemies_formation() # Creates and populates self.enemies (EnemiesGroup)
@@ -767,7 +848,7 @@ class Game:
         self.mainScreenActive = False
         self.gameplayActive = True
         self.gameOverActive = False
-        print("Game reset for AI.")
+        # print("Game reset for AI.") # Reduced verbosity
         return self._get_observation_for_ai()
 
     def step_ai(self, action):
@@ -779,29 +860,27 @@ class Game:
             if self.gameOverActive:
                 return self._get_observation_for_ai(), 0, True, {'lives': self.lives, 'score': self.score}
             else: # e.g. "Next Round" screen
-                 # We can either fast-forward this or return current state with no reward.
-                 # For simplicity, let's assume AI step implies active gameplay.
-                 # This part needs careful handling for robust AI training.
-                 print("Warning: AI step called when gameplay not fully active.")
-                 # Potentially advance timers to skip non-interactive parts:
-                 current_time = pg.time.get_ticks()
+                 current_time_pause = pg.time.get_ticks()
                  if not self.enemies and not self.explosionsGroup : # Round cleared, in "Next Round" phase
-                    if current_time - self.roundOverTimer >= 3000:
+                    # If enough time has passed for the "Next Round" message
+                    if current_time_pause - self.roundOverTimer >= 3000: # Simulating the pause
                         self.enemy_start_y = min(self.enemy_start_y + config.ENEMY_MOVE_DOWN, config.BLOCKERS_POSITION - 100)
                         if self.enemy_start_y >= config.BLOCKERS_POSITION - 100:
-                             self.gameOverActive = True # Game over if enemies start too low.
+                             self.gameOverActive = True 
                              return self._get_observation_for_ai(), 0, True, {'lives': self.lives, 'score': self.score}
                         self._reset_round_state(self.score)
                         self.gameplayActive = True
+                    # else: game is still in "Next Round" pause, no action taken yet
+                        # return self._get_observation_for_ai(), 0, False, {'lives': self.lives, 'score': self.score}
+                 # If still not gameplayActive after potential advance, return current state.
+                 if not self.gameplayActive:
+                     return self._get_observation_for_ai(), 0, False, {'lives': self.lives, 'score': self.score}
 
 
         prev_score = self.score
         prev_lives = self.lives
 
         # --- Apply AI action ---
-        # Simulate key presses based on AI action
-        # This is a simplified mapping. More complex actions might be needed.
-        current_keys_state = pg.key.get_pressed() # Get current real keys (mostly for human override/debug)
         simulated_action_keys = {pg.K_LEFT: False, pg.K_RIGHT: False, pg.K_SPACE: False}
 
         if action == config.ACTION_LEFT:
@@ -810,9 +889,7 @@ class Game:
             simulated_action_keys[pg.K_RIGHT] = True
         elif action == config.ACTION_SHOOT:
             simulated_action_keys[pg.K_SPACE] = True
-        # config.ACTION_NONE results in no simulated key presses for movement/shooting
 
-        # Update player based on simulated action (direct manipulation for AI)
         if self.shipCurrentlyAlive and self.player:
             if simulated_action_keys[pg.K_LEFT]:
                 self.player.rect.x = max(10, self.player.rect.x - self.player.speed)
@@ -820,82 +897,79 @@ class Game:
                 self.player.rect.x = min(config.SCREEN_WIDTH - self.player.rect.width - 10, 
                                          self.player.rect.x + self.player.speed)
             if simulated_action_keys[pg.K_SPACE]:
-                self._handle_player_shooting() # Uses self.score, self.shipCurrentlyAlive, self.bullets
+                self._handle_player_shooting() 
 
 
-        # --- Update game state for one frame (logic from _update_gameplay_state) ---
-        currentTime = pg.time.get_ticks() # Or use a fixed dt for AI steps
+        # --- Update game state for one frame ---
+        currentTime = pg.time.get_ticks() 
         
-        self.enemies.update(currentTime)
+        # Update non-player game elements first
+        self.enemies.update(currentTime) # EnemiesGroup movement logic
         
-        # Update sprites (excluding player if already handled, or pass simulated keys)
-        # For AI, drawing on screen_surface might be skipped.
-        # So, sprite updates might need to function without screen_surface if not rendering.
-        # For now, assume they are robust or AI implies rendering.
-        # For allSprites.update, pass the AI's simulated keys, not human's.
-        # Player's movement is already handled. The player.update method might conflict if called again by allSprites.
-        # Better: player has move_left(), move_right(), shoot() methods for AI.
-        # Temporary: For now, assume player update in allSprites is benign or player has been moved.
-        
-        # The player's visual update (drawing) still needs to happen.
-        # Let's make `allSprites.update` pass a `keys` dict that AI controls for player part.
-        # For this, Ship.update should accept this dict instead of pg.key.get_pressed().
-        # This is a deeper refactor. For now, player handled, other sprites update:
-        
-        # Simplified sprite updates for AI step (non-player)
-        # These calls will include drawing if update methods draw.
-        # This should be fine even if AI doesn't "see" pixels, for game logic.
-        for sprite in self.allSprites:
-            if sprite != self.player: # Player was handled by AI action
-                # Sprite.update needs a consistent signature: (self, keys, current_time, screen_surface)
-                # Pass None for keys if not relevant for these sprites.
-                sprite.update(None, currentTime, self.screen) 
-        
+        # Update other sprites (bullets, explosions, mystery ship)
+        # They need screen_surface for their draw calls within update.
+        # For headless AI, this might be an issue if screen_surface is not real.
+        # Assuming rendering is occurring or sprite updates are robust.
+        for sprite in self.allSprites: # This includes player, enemies, blockers, lives
+            if sprite != self.player: # Player movement already handled
+                # Pass None for keys, as non-player sprites don't use them in their update
+                sprite.update(None, currentTime, self.screen)
+            elif self.player and sprite == self.player: # Ensure player sprite itself is drawn
+                 self.player.update(simulated_action_keys, currentTime, self.screen)
+
+
         self.bullets.update(None, currentTime, self.screen)
         self.enemyBullets.update(None, currentTime, self.screen)
         self.explosionsGroup.update(None, currentTime, self.screen)
 
 
-        self._check_collisions_and_deaths() # This updates score, lives, gameOverActive
+        self._check_collisions_and_deaths() 
         self._respawn_player_if_needed(currentTime)
         self._trigger_enemy_shooting(currentTime)
-        # Skipping _play_background_music for AI speed
+        # Skipping _play_background_music for AI speed, could be enabled if desired
+
+        # Check for game over by enemies reaching bottom (after updates)
+        if self.enemies.bottom >= config.SCREEN_HEIGHT - 80 :
+            if self.shipCurrentlyAlive and pg.sprite.spritecollideany(self.player, self.enemies):
+                self._player_death() 
+            if self.enemies.bottom >= config.SCREEN_HEIGHT:
+                if not self.gameOverActive: # Prevent multiple calls if already game over
+                    self._player_death(final_death=True)
 
         # --- Calculate reward ---
-        reward = (self.score - prev_score)  # Score change
-        if self.lives < prev_lives: # Lost a life
-            reward -= 50 # Example penalty, tune as needed
+        reward = (self.score - prev_score) 
+        if self.lives < prev_lives: 
+            reward -= 50 # Standard penalty for losing a life
 
         # --- Check if game is done ---
         done = self.gameOverActive
-        if not self.enemies and not self.explosionsGroup and not done: # Round cleared
-            reward += 100 # Bonus for clearing round
-            # For simple AI tasks, one round might be "done". Or continue.
-            # If continuing, need to handle the "Next Round" screen logic briefly.
-            # (This is partly handled at start of step_ai for now)
-            pass
-
+        
+        # Special handling for round clear
+        round_cleared_this_step = False
+        if not self.enemies and not self.explosionsGroup and not done:
+            if self.gameplayActive: # Ensure it was active before clearing
+                round_cleared_this_step = True
+                reward += 100 # Bonus for clearing round
+                self.gameplayActive = False # Transition to "Next Round" state
+                self.roundOverTimer = currentTime # Start timer for "Next Round" message
+                # Game is not "done" in the sense of game over, but round is complete.
+                # For some AI setups, clearing a round might be an episode end.
+                # Here, we assume the game continues to the next round.
 
         # --- Get new observation and info ---
         observation = self._get_observation_for_ai()
-        info = {'lives': self.lives, 'score': self.score, 'is_round_cleared': (not self.enemies and not self.explosionsGroup)}
+        info = {'lives': self.lives, 'score': self.score, 'is_round_cleared': round_cleared_this_step}
         
-        # Tick clock for AI too, to keep Pygame events processing and allow rendering if enabled
-        self.clock.tick(config.FPS) # Or a different tick rate for AI headless mode
+        self.clock.tick(config.FPS) 
 
         return observation, reward, done, info
 
     def _get_observation_for_ai(self):
         """Returns the current game state as an observation for the AI."""
-        # For pixel-based agents, render to a surface and get its array.
-        # For feature-based, extract relevant game variables.
-        # Placeholder: return raw pixel data of the screen.
-        # Important: Ensure the screen is up-to-date before getting pixels.
-        # This might mean calling draw methods if AI step doesn't draw.
-        # self.screen.blit(self.background, (0,0))
-        # self.allSprites.draw(self.screen) # If sprites don't draw in update
-        # self.explosionsGroup.draw(self.screen)
-        # ... draw HUD ...
+        # Ensure the screen is fully up-to-date if rendering is not part of step_ai's main loop.
+        # If render_for_ai is called separately, this can just grab the current surface.
+        # If step_ai is expected to produce the renderable state, ensure drawing happened.
+        # The current step_ai does call sprite update methods that include drawing.
         return pg.surfarray.array3d(pg.display.get_surface())
 
 
@@ -903,21 +977,26 @@ class Game:
         """Renders the current game state. Useful if AI runs headless but occasional render is needed."""
         self.screen.blit(self.background, (0,0))
         
-        # Simplest is to call the sprite update methods which also handle drawing
-        # Passing None for keys as AI actions are handled in step_ai directly
-        # This might be slow if AI calls render frequently.
-        current_time = pg.time.get_ticks()
-        self.allSprites.update(None, current_time, self.screen)
-        self.bullets.update(None, current_time, self.screen)
-        self.enemyBullets.update(None, current_time, self.screen)
-        self.explosionsGroup.update(None, current_time, self.screen)
+        current_time = pg.time.get_ticks() # Get current time for updates
+        # Create a dummy keys state for sprite updates that might expect it.
+        # For AI rendering, player actions are not from live key presses.
+        dummy_keys = pg.key.get_pressed() # Or a dict of all False if no keys should affect rendering
 
-        # Draw HUD
+        # Update and draw all sprites.
+        # Player sprite uses its own internal state set by AI actions.
+        # Other sprites update based on game logic.
+        # The update methods of sprites in allSprites already handle drawing.
+        self.allSprites.update(dummy_keys, current_time, self.screen)
+        self.bullets.update(dummy_keys, current_time, self.screen)
+        self.enemyBullets.update(dummy_keys, current_time, self.screen)
+        self.explosionsGroup.update(dummy_keys, current_time, self.screen)
+
+        # Draw HUD elements that are not sprites
         self.scoreValueText = Text(config.GAME_FONT, 20, str(self.score), config.GREEN, 85, 5)
         self.scoreLabelText.draw(self.screen)
         self.scoreValueText.draw(self.screen)
         self.livesLabelText.draw(self.screen)
-        # Lives icons are in allSprites and should have been updated/drawn.
+        # Lives icons (Life sprites) are part of self.allSprites and are drawn by its update.
 
         pg.display.update()
 

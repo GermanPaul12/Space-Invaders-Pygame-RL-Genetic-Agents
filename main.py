@@ -38,11 +38,12 @@ def main():
     parser.add_argument("--load_model", action='store_true', help="Load a pre-trained model for the agent.")
     parser.add_argument("--render", action='store_true', help="Render game during AI training/testing.")
     parser.add_argument("--max_steps_per_episode", type=int, default=2000, help="Max steps per episode for AI.")
+    parser.add_argument("--silent", action='store_true', help="Run the game without sounds.")
 
 
     args = parser.parse_args()
 
-    game_instance = Game()
+    game_instance = Game(silent_mode=args.silent)
 
     if args.mode == 'play':
         if args.agent != 'human':

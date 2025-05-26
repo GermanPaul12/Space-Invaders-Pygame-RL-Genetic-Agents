@@ -1,4 +1,4 @@
-# agents/dqn_agent.py
+# agents/dqn_agent.py (and by extension for ppo_agent.py, genetic_agent.py, a2c_agent.py)
 import random
 import numpy as np
 import torch
@@ -7,50 +7,47 @@ import torch.optim as optim
 import torch.nn.functional as F
 from collections import deque, namedtuple
 from .agent import Agent
+from PIL import Image # Import Pillow Image
 
 # Preprocessing (example, adjust as needed)
 def preprocess_observation(obs, new_size=(84, 84)):
     # Convert to grayscale, resize, normalize, and change to CxHxW
     if obs is None: # Handle initial reset where obs might be None
+        # Return a black image of the correct preprocessed shape
         return np.zeros((1, new_size[0], new_size[1]), dtype=np.float32)
 
-    img = np.array(obs) # HxWxC
-    img = np.dot(img[...,:3], [0.2989, 0.5870, 0.1140]) # Grayscale: HxW
+    # Ensure obs is a NumPy array (it should be from game.py)
+    # game._get_observation_for_ai() returns pg.surfarray.array3d() which is HxWxC
     
-    # Resize (Using PIL/Pillow is better for quality, but simple slicing for now or use cv2)
-    # This is a very crude resize, proper resizing (e.g. cv2.resize) is recommended
-    # For simplicity here, let's assume the input image is roughly proportional and we can take a section
-    # Or, use torchvision.transforms if integrating more deeply
-    # temp_h, temp_w = img.shape
-    # if temp_h > new_size[0] and temp_w > new_size[1]:
-    #     img = img[:new_size[0], :new_size[1]] # Crude crop/slice
-    # else:
-    #     # If smaller, pad or handle differently. For now, this example might fail.
-    #     # A robust solution would use cv2.resize or similar.
-    #     pass # Keep original if too small to crop meaningfully this way.
-    # For now, let's assume game.py _get_observation_for_ai returns a fixed size image,
-    # and we'll just do the grayscale and channel permute.
-    # Actual resizing would be:
-    # import cv2
-    # img = cv2.resize(img, new_size, interpolation=cv2.INTER_AREA)
-
-
-    img = img.astype(np.float32) / 255.0 # Normalize
-    img = np.expand_dims(img, axis=0) # CxHxW (C=1 for grayscale)
-    return img
+    # Convert Pygame surface array (HxWxC) to PIL Image
+    pil_image = Image.fromarray(obs.astype(np.uint8))
+    
+    # Convert to grayscale
+    pil_image = pil_image.convert('L') # 'L' mode is (8-bit pixels, black and white)
+    
+    # Resize
+    pil_image = pil_image.resize(new_size, Image.Resampling.LANCZOS) # Use a good resampling filter
+    
+    # Convert back to NumPy array
+    img_array = np.array(pil_image, dtype=np.float32) # Shape: (new_size_H, new_size_W)
+    
+    # Normalize
+    img_array = img_array / 255.0
+    
+    # Add channel dimension: (H, W) -> (1, H, W) for PyTorch Conv2D
+    img_array = np.expand_dims(img_array, axis=0) 
+    
+    return img_array # Shape: (1, new_size_H, new_size_W)
 
 
 class QNetwork(nn.Module):
-    def __init__(self, input_channels, num_actions, h=84, w=84):
+    def __init__(self, input_channels, num_actions, h=84, w=84): # h,w are target preprocessed dimensions
         super(QNetwork, self).__init__()
-        # Simplified CNN for demonstration
-        # Input: (batch_size, input_channels, H, W) e.g. (N, 1, 84, 84) for grayscale
-        # Or (N, 4, 84, 84) if stacking frames
         self.conv1 = nn.Conv2d(input_channels, 32, kernel_size=8, stride=4)
         self.conv2 = nn.Conv2d(32, 64, kernel_size=4, stride=2)
         self.conv3 = nn.Conv2d(64, 64, kernel_size=3, stride=1)
         
-        # Calculate flattened size (dummy forward pass)
+        # Calculate flattened size based on h, w (which are now the actual input H, W to conv layers)
         def conv_output_size(size, kernel_size, stride):
             return (size - (kernel_size - 1) - 1) // stride + 1
         
@@ -61,7 +58,7 @@ class QNetwork(nn.Module):
         self.fc1 = nn.Linear(flattened_size, 512)
         self.fc2 = nn.Linear(512, num_actions)
 
-    def forward(self, x):
+    def forward(self, x): # x should be (N, C, H, W) e.g. (N, 1, 84, 84)
         x = F.relu(self.conv1(x))
         x = F.relu(self.conv2(x))
         x = F.relu(self.conv3(x))
@@ -77,6 +74,7 @@ class ReplayBuffer:
         self.memory = deque([], maxlen=capacity)
 
     def push(self, *args):
+        # Args are already preprocessed numpy arrays for state and next_state
         self.memory.append(Transition(*args))
 
     def sample(self, batch_size):
@@ -87,23 +85,22 @@ class ReplayBuffer:
 
 
 class DQNAgent(Agent):
-    def __init__(self, action_size, observation_shape, # observation_shape expected as (C, H, W)
+    def __init__(self, action_size, observation_shape, # observation_shape expected as (C, H, W) e.g. (1, 84, 84)
                  buffer_size=10000, batch_size=32, gamma=0.99,
                  lr=1e-4, target_update_freq=1000, eps_start=1.0,
-                 eps_end=0.01, eps_decay=50000): # eps_decay in steps
-        super().__init__(action_size, observation_shape)
+                 eps_end=0.01, eps_decay=50000):
+        super().__init__(action_size, observation_shape) # observation_shape is (1, 84, 84)
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         print(f"DQN Agent using device: {self.device}")
 
-        # Assuming observation_shape is (C, H, W) for preprocessed images
-        # If raw pixels (H, W, C) are passed, preprocess_observation will handle it
-        # For QNetwork, input_channels should be C from observation_shape
-        self.input_channels = observation_shape[0] if observation_shape else 1 # Default to 1 for grayscale
+        self.input_channels = observation_shape[0] # C from (C, H, W)
+        self.processed_h = observation_shape[1] # H from (C, H, W)
+        self.processed_w = observation_shape[2] # W from (C, H, W)
 
-        self.policy_net = QNetwork(self.input_channels, action_size).to(self.device)
-        self.target_net = QNetwork(self.input_channels, action_size).to(self.device)
+        self.policy_net = QNetwork(self.input_channels, action_size, h=self.processed_h, w=self.processed_w).to(self.device)
+        self.target_net = QNetwork(self.input_channels, action_size, h=self.processed_h, w=self.processed_w).to(self.device)
         self.target_net.load_state_dict(self.policy_net.state_dict())
-        self.target_net.eval() # Target network is not trained directly
+        self.target_net.eval()
 
         self.optimizer = optim.Adam(self.policy_net.parameters(), lr=lr)
         self.memory = ReplayBuffer(buffer_size)
@@ -116,10 +113,10 @@ class DQNAgent(Agent):
         self.eps_decay = eps_decay
         self.steps_done = 0
 
-    def choose_action(self, observation): # observation is raw from game
-        # Preprocess observation
-        state = preprocess_observation(observation)
-        state_tensor = torch.from_numpy(state).float().unsqueeze(0).to(self.device) # Add batch dim
+    def choose_action(self, raw_observation): # observation is raw from game
+        # Preprocess observation using the new_size from self.processed_h, self.processed_w
+        state_np = preprocess_observation(raw_observation, new_size=(self.processed_h, self.processed_w))
+        state_tensor = torch.from_numpy(state_np).float().unsqueeze(0).to(self.device) # Add batch dim
 
         eps_threshold = self.eps_end + (self.eps_start - self.eps_end) * \
                         np.exp(-1. * self.steps_done / self.eps_decay)
@@ -127,53 +124,55 @@ class DQNAgent(Agent):
 
         if random.random() > eps_threshold:
             with torch.no_grad():
-                # Get Q values from policy_net
                 q_values = self.policy_net(state_tensor)
-                # Choose action with max Q value
                 action = q_values.max(1)[1].view(1, 1).item()
         else:
             action = random.randrange(self.action_size)
         return action
 
-    def store_transition(self, state, action, next_state, reward, done):
+    def store_transition(self, raw_state, action, raw_next_state, reward, done):
         # Preprocess states before storing
-        processed_state = preprocess_observation(state)
-        processed_next_state = preprocess_observation(next_state)
-        self.memory.push(processed_state, action, processed_next_state, reward, done)
+        processed_state_np = preprocess_observation(raw_state, new_size=(self.processed_h, self.processed_w))
+        processed_next_state_np = preprocess_observation(raw_next_state, new_size=(self.processed_h, self.processed_w))
+        
+        # ReplayBuffer stores numpy arrays (state, action, next_state, reward, done)
+        self.memory.push(processed_state_np, action, processed_next_state_np, reward, done)
 
     def learn(self):
         if len(self.memory) < self.batch_size:
-            return None # Not enough samples to learn
+            return None
 
         transitions = self.memory.sample(self.batch_size)
-        batch = Transition(*zip(*transitions)) # Converts batch-array of Transitions to Transition of batch-arrays
+        batch = Transition(*zip(*transitions))
 
-        # Convert to tensors
-        state_batch = torch.from_numpy(np.array(batch.state)).float().to(self.device)
-        action_batch = torch.tensor(batch.action, device=self.device).unsqueeze(1) # [[0],[1]...]
-        reward_batch = torch.tensor(batch.reward, device=self.device).float()
-        next_state_batch = torch.from_numpy(np.array(batch.next_state)).float().to(self.device)
+        # Convert preprocessed numpy arrays from buffer to tensors
+        # batch.state is a tuple of numpy arrays, so stack them
+        state_batch = torch.from_numpy(np.stack(batch.state)).float().to(self.device)
+        action_batch = torch.tensor(batch.action, device=self.device, dtype=torch.long).unsqueeze(1)
+        reward_batch = torch.tensor(batch.reward, device=self.device, dtype=torch.float32)
+        next_state_batch = torch.from_numpy(np.stack(batch.next_state)).float().to(self.device)
         done_batch = torch.tensor(batch.done, device=self.device, dtype=torch.bool)
 
-
-        # Get Q(s_t, a)
         q_values = self.policy_net(state_batch).gather(1, action_batch)
 
-        # Get max Q(s_{t+1}, a') from target network
-        next_q_values = self.target_net(next_state_batch).max(1)[0].detach()
-        # If s_{t+1} is terminal, then Q value is just reward
-        expected_q_values = reward_batch + (self.gamma * next_q_values * (~done_batch))
+        next_q_values = torch.zeros(self.batch_size, device=self.device)
+        # Compute V(s_{t+1}) for all next states.
+        # For non-final next states, V(s_{t+1}) = max_a Q_target(s_{t+1}, a)
+        # For final states, V(s_{t+1}) = 0
+        non_final_mask = ~done_batch
+        non_final_next_states = next_state_batch[non_final_mask]
 
-        # Compute Huber loss (or MSE)
+        if non_final_next_states.size(0) > 0: # Check if there are any non-final states
+            next_q_values[non_final_mask] = self.target_net(non_final_next_states).max(1)[0].detach()
+        
+        expected_q_values = reward_batch + (self.gamma * next_q_values)
+
         loss = F.smooth_l1_loss(q_values, expected_q_values.unsqueeze(1))
 
-        # Optimize
         self.optimizer.zero_grad()
         loss.backward()
-        # torch.nn.utils.clip_grad_norm_(self.policy_net.parameters(), 1) # Optional grad clipping
         self.optimizer.step()
 
-        # Update target network
         if self.steps_done % self.target_update_freq == 0:
             self.target_net.load_state_dict(self.policy_net.state_dict())
         
@@ -185,8 +184,6 @@ class DQNAgent(Agent):
             'target_net_state_dict': self.target_net.state_dict(),
             'optimizer_state_dict': self.optimizer.state_dict(),
             'steps_done': self.steps_done,
-            'epsilon': self.eps_end + (self.eps_start - self.eps_end) * \
-                       np.exp(-1. * self.steps_done / self.eps_decay)
         }, path)
         print(f"DQN model saved to {path}")
 
@@ -195,8 +192,7 @@ class DQNAgent(Agent):
         self.policy_net.load_state_dict(checkpoint['policy_net_state_dict'])
         self.target_net.load_state_dict(checkpoint['target_net_state_dict'])
         self.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
-        self.steps_done = checkpoint.get('steps_done', 0) # Handle older checkpoints
-        # Epsilon will be recalculated based on steps_done
-        self.policy_net.train() # Ensure policy_net is in train mode
-        self.target_net.eval()  # Ensure target_net is in eval mode
+        self.steps_done = checkpoint.get('steps_done', 0)
+        self.policy_net.train()
+        self.target_net.eval()
         print(f"DQN model loaded from {path}")
