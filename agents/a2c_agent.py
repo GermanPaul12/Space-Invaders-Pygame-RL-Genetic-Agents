@@ -9,7 +9,7 @@ from .agent import Agent
 from .dqn_agent import preprocess_observation # Reuse preprocessing
 
 class ActorCriticNetwork(nn.Module):
-    def __init__(self, input_channels, num_actions, h=84, w=84): # h,w are target preprocessed dimensions
+    def __init__(self, input_channels, num_actions, h=84, w=84):
         super(ActorCriticNetwork, self).__init__()
         self.conv1 = nn.Conv2d(input_channels, 32, kernel_size=8, stride=4)
         self.conv2 = nn.Conv2d(32, 64, kernel_size=4, stride=2)
@@ -22,7 +22,6 @@ class ActorCriticNetwork(nn.Module):
         flattened_size = conv_h * conv_w * 64
         
         self.fc_shared = nn.Linear(flattened_size, 256)
-
         self.actor_fc = nn.Linear(256, num_actions)
         self.critic_fc = nn.Linear(256, 1)
 
@@ -31,18 +30,14 @@ class ActorCriticNetwork(nn.Module):
         x = F.relu(self.conv2(x))
         x = F.relu(self.conv3(x))
         x = x.view(x.size(0), -1)
-        
         x_shared = F.relu(self.fc_shared(x))
-        
-        action_logits = self.actor_fc(x_shared) # Output logits for Categorical
+        action_logits = self.actor_fc(x_shared)
         state_value = self.critic_fc(x_shared)
-        
-        # Return logits for actor, directly use F.softmax or Categorical(logits=...) later
         return action_logits, state_value
 
 
 class A2CAgent(Agent):
-    def __init__(self, action_size, observation_shape, # (C, H, W) e.g. (1, 84, 84)
+    def __init__(self, action_size, observation_shape,
                  lr=7e-4, gamma=0.99, entropy_coef=0.01, value_loss_coef=0.5):
         super().__init__(action_size, observation_shape)
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -62,29 +57,24 @@ class A2CAgent(Agent):
         self.value_loss_coef = value_loss_coef
 
         self.log_probs = []
-        self.state_values = [] # V(s_t) predicted by critic
+        self.state_values = []
         self.rewards = []
         self.dones = []
+        self.action_logits_buffer = [] # To store logits for entropy calculation
 
     def choose_action(self, raw_observation):
         state_np = preprocess_observation(raw_observation, new_size=(self.processed_h, self.processed_w))
         state_tensor = torch.from_numpy(state_np).float().unsqueeze(0).to(self.device)
         
-        # No grad not strictly necessary for A2C action selection if only sampling,
-        # but good practice if only using forward pass for decision.
-        # For A2C, we need gradients through state_value for critic, and action_logits for actor.
-        # So, no_grad should NOT be used here if planning to use the output for training directly.
-        # However, A2C typically stores log_probs and values and then re-evaluates or uses these.
-        # For simplicity, we will use with torch.no_grad() for selection, and rely on stored log_probs and values.
-        with torch.no_grad(): # This is okay if log_prob & value are stored based on current net for *this* step
-            action_logits, state_value = self.network(state_tensor) 
+        # REMOVED with torch.no_grad(): here
+        action_logits, state_value = self.network(state_tensor) 
         
-        m = Categorical(logits=action_logits) # Use logits directly
+        m = Categorical(logits=action_logits)
         action = m.sample()
         
-        # Store log_prob of chosen action and predicted state_value for *current* state
-        self.log_probs.append(m.log_prob(action)) 
-        self.state_values.append(state_value) 
+        self.log_probs.append(m.log_prob(action))
+        self.state_values.append(state_value)
+        self.action_logits_buffer.append(action_logits) # Store logits
         
         return action.item()
 
@@ -96,67 +86,53 @@ class A2CAgent(Agent):
         if not self.log_probs:
             return None
 
-        R = 0 # This will be V(s_N) or 0 if s_N is terminal
+        R = 0
         if not self.dones[-1] and raw_next_observation is not None:
             next_state_p_np = preprocess_observation(raw_next_observation, new_size=(self.processed_h, self.processed_w))
             next_state_tensor = torch.from_numpy(next_state_p_np).float().unsqueeze(0).to(self.device)
-            with torch.no_grad():
+            with torch.no_grad(): # V(s_next) is a target, so no grad needed through it
                 _, R_tensor = self.network(next_state_tensor)
             R = R_tensor.item()
 
-        # Calculate returns (Gt = sum of discounted rewards up to V(s_N))
-        policy_returns = [] # G_t
+        policy_returns = []
         for r, d in zip(reversed(self.rewards), reversed(self.dones)):
-            if d: # If state was terminal, future rewards are 0
-                R = 0
+            if d: R = 0
             R = r + self.gamma * R
             policy_returns.insert(0, R)
         
-        policy_returns = torch.tensor(policy_returns, device=self.device, dtype=torch.float32)
+        policy_returns_t = torch.tensor(policy_returns, device=self.device, dtype=torch.float32)
         
-        # Concatenate stored tensors
-        log_probs_t = torch.cat(self.log_probs) # (N,)
-        state_values_t = torch.cat(self.state_values).squeeze() # (N,)
+        log_probs_t = torch.cat(self.log_probs) 
+        state_values_t = torch.cat(self.state_values).squeeze(-1) # Squeeze the last dim (N,1) -> (N,)
+        action_logits_t = torch.cat(self.action_logits_buffer)
 
-        advantages = policy_returns - state_values_t # A_t = G_t - V(s_t)
 
-        # Actor loss
-        actor_loss = -(log_probs_t * advantages.detach()).mean() # Detach advantages for actor update
+        # Ensure consistent 1D tensors if N=1 (batch size of 1 step)
+        if state_values_t.ndim == 0: state_values_t = state_values_t.unsqueeze(0)
+        if policy_returns_t.ndim == 0: policy_returns_t = policy_returns_t.unsqueeze(0)
+        if log_probs_t.ndim == 0: log_probs_t = log_probs_t.unsqueeze(0)
+        # action_logits_t will be (N, num_actions), which is fine for Categorical
 
-        # Critic loss
-        critic_loss = F.mse_loss(state_values_t, policy_returns)
+        advantages = policy_returns_t - state_values_t
+        actor_loss = -(log_probs_t * advantages.detach()).mean()
+        critic_loss = F.mse_loss(state_values_t, policy_returns_t)
 
-        # Entropy (re-evaluate action_logits for current states to get distribution for entropy)
-        # This makes the `learn` depend on current states, which are not passed.
-        # Alternative: store states too, or skip entropy for simplicity in this basic A2C.
-        # For now, let's compute it if we had stored states.
-        # If log_probs are from Categorical(logits=...), then m.entropy() would be needed.
-        # This simplified A2C doesn't re-evaluate the policy for entropy bonus easily.
-        # Let's calculate entropy if we had the logits that produced log_probs
-        # For a more robust entropy, one might need to re-run states through network or store action_logits.
-        # This part is tricky without storing more info or re-evaluating.
-        # Let's assume self.log_probs were derived from some m = Categorical(logits=...)
-        # We would need the logits again to compute entropy m.entropy()
-        # For a simple version, let's make entropy_term zero.
-        entropy_term = 0 
-        # A more proper way would be to re-evaluate the stored states.
-        # if len(self.stored_states_for_entropy) > 0: # Hypothetical stored states
-        #    logits_for_entropy, _ = self.network(torch.stack(self.stored_states_for_entropy))
-        #    m_entropy = Categorical(logits=logits_for_entropy)
-        #    entropy_term = m_entropy.entropy().mean()
-
+        # Entropy calculation
+        m_entropy = Categorical(logits=action_logits_t)
+        entropy_term = m_entropy.entropy().mean()
 
         total_loss = actor_loss + self.value_loss_coef * critic_loss - self.entropy_coef * entropy_term
 
         self.optimizer.zero_grad()
         total_loss.backward()
-        torch.nn.utils.clip_grad_norm_(self.network.parameters(), 0.5) # Optional
+        torch.nn.utils.clip_grad_norm_(self.network.parameters(), 0.5)
         self.optimizer.step()
 
         self.log_probs = []
         self.state_values = []
         self.rewards = []
         self.dones = []
+        self.action_logits_buffer = [] # Clear logits buffer
         
         return total_loss.item()
 
