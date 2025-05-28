@@ -1,13 +1,16 @@
 import pygame as pg
 import sys
+import os
 from random import choice
 from . import config
+import numpy as np
 
 # Initialize Pygame's font module (mixer pre_init handled in Game)
 pg.font.init()
 
 # Global dictionary for images, to be populated after pygame display is initialized
 IMAGES = {}
+_images_loaded_and_converted = False # Module-level flag
 
 # Define DummySound class at the module level for global access if needed as a fallback
 class DummySound:
@@ -16,21 +19,32 @@ class DummySound:
     def fadeout(self, *args, **kwargs): pass
     def set_volume(self, *args, **kwargs): pass
 
-def load_all_game_images():
-    """Loads all game images into the global IMAGES dictionary."""
-    global IMAGES
+def load_all_game_images(force_convert=False):
+    global IMAGES, _images_loaded_and_converted
+    if _images_loaded_and_converted and not force_convert: # Only load and convert once per process
+        return
+
+    print(f"Process {os.getpid()}: Loading images...")
+    display_initialized = pg.display.get_init() and pg.display.get_surface() is not None
+
     for name in config.IMG_NAMES:
         try:
             image_path = config.IMAGE_PATH + '{}.png'.format(name)
-            IMAGES[name] = pg.image.load(image_path).convert_alpha()
+            loaded_image = pg.image.load(image_path)
+            if display_initialized or force_convert: # Only convert if display is set or forced
+                IMAGES[name] = loaded_image.convert_alpha()
+                # print(f"  Converted {name}")
+            else:
+                IMAGES[name] = loaded_image # Store unconverted surface
+                # print(f"  Loaded (unconverted) {name}")
         except pg.error as e:
+            # ... (your existing error handling for missing images) ...
             print(f"Error loading image '{image_path}': {e}")
-            IMAGES[name] = pg.Surface((30, 30))
-            IMAGES[name].fill(config.RED)
-            font = pg.font.Font(None, 12)
-            text_surf = font.render(name[:4], True, config.WHITE)
-            text_rect = text_surf.get_rect(center=IMAGES[name].get_rect().center)
-            IMAGES[name].blit(text_surf, text_rect)
+            IMAGES[name] = pg.Surface((30,30)); IMAGES[name].fill(config.RED)
+
+    if display_initialized or force_convert:
+        _images_loaded_and_converted = True
+    print(f"Process {os.getpid()}: Image loading complete. Converted: {_images_loaded_and_converted}")
 
 class Ship(pg.sprite.Sprite):
     def __init__(self):
@@ -339,21 +353,26 @@ class Text(object):
 
 
 class Game:
-    def __init__(self, silent_mode=False, ai_training_mode=False):
+    def __init__(self, silent_mode=False, ai_training_mode=False, headless_worker_mode=False): # New flag
         self.silent_mode = silent_mode
         self.ai_training_mode = ai_training_mode
+        self.headless_worker_mode = headless_worker_mode
 
         if not self.silent_mode:
             pg.mixer.pre_init(44100, -16, 1, 4096)
         else:
-            try:
-                pg.mixer.init(frequency=22050, size=-16, channels=2, buffer=512)
-            except pg.error:
-                print("Mixer could not be initialized in silent mode (this is usually fine).")
+            try: pg.mixer.init(frequency=22050, size=-16, channels=2, buffer=512)
+            except pg.error: print("Mixer init failed in silent (this is often ok).")
 
         pg.init()
-        self.screen = pg.display.set_mode((config.SCREEN_WIDTH, config.SCREEN_HEIGHT))
-        pg.display.set_caption('Space Invaders')
+        if not self.headless_worker_mode:
+            self.screen = pg.display.set_mode((config.SCREEN_WIDTH, config.SCREEN_HEIGHT))
+            pg.display.set_caption('Space Invaders')
+        else:
+            # For headless workers, create an in-memory surface of the same dimensions
+            # This surface will be used by _get_observation_for_ai
+            self.screen = pg.Surface((config.SCREEN_WIDTH, config.SCREEN_HEIGHT))
+            # No display caption needed for headless
         load_all_game_images()
         self.clock = pg.time.Clock()
         try:
@@ -769,31 +788,42 @@ class Game:
     def step_ai(self, action):
         # If game is paused for "Next Round" or "Game Over" (for AI, these pauses are near zero)
         current_time_step = pg.time.get_ticks()
-        if not self.gameplayActive:
-            if self.gameOverActive: # Game is over, ship is dead or enemies won
-                if self.ai_training_mode and current_time_step - self.roundOverTimer >= self.inter_round_delay:
-                    # AI mode: Game over state has "timed out" (instantly if delay is 0)
-                    # The episode should end here. The training loop will call reset_for_ai.
-                    pass # Let the done flag handle this.
-                elif not self.ai_training_mode: # Human player might be on game over screen
-                    # This case shouldn't be hit if step_ai is only for AI.
-                    # But if it were, just return current state.
-                    return self._get_observation_for_ai(), 0, True, {'lives': self.lives, 'score': self.score}
 
+        # Handle transitions between game states (Next Round, Game Over)
+        # This logic allows the game to advance out of pause states quickly for AI.
+        if not self.gameplayActive:
+            if self.gameOverActive:
+                # If game over, and in AI mode, the inter_round_delay (which is 0 for AI) should have passed.
+                # The 'done_flag' will be True, and the training loop will reset.
+                # No special action needed here beyond returning the state.
+                # The 'done_flag' will be set to self.gameOverActive later.
+                pass # Let the main logic and done_flag handle termination
+            
             elif not self.enemies and not self.explosionsGroup: # "Next Round" phase
-                if self.ai_training_mode and current_time_step - self.roundOverTimer >= self.inter_round_delay:
+                # This means all enemies are cleared, and no explosions are active.
+                # The roundOverTimer was set when the last enemy/explosion cleared.
+                if self.ai_training_mode and (current_time_step - self.roundOverTimer >= self.inter_round_delay):
+                    # AI mode: "Next Round" delay has passed (instantly if delay is 0)
                     self.enemy_start_y = min(self.enemy_start_y + config.ENEMY_MOVE_DOWN, config.BLOCKERS_POSITION - 100)
                     if self.enemy_start_y >= config.BLOCKERS_POSITION - 100:
                         self.gameOverActive = True # Mark as game over if enemies start too low
+                        # game will effectively end here due to done_flag being True
                     else:
-                        self._reset_round_state(self.score)
-                        self.gameplayActive = True
-                # If not AI mode or delay hasn't passed, game is still paused.
-                # Return current state, not done, no reward.
-                if not self.gameplayActive and not self.gameOverActive :
-                     return self._get_observation_for_ai(), 0, False, {'lives': self.lives, 'score': self.score, 'is_round_cleared': True}
+                        self._reset_round_state(self.score) # Prepare for the next round
+                        self.gameplayActive = True         # Resume gameplay
+                
+                # If still not gameplayActive (e.g., human player waiting for visual delay, or AI mode about to transition)
+                # and not game over, return current state indicating round was cleared.
+                if not self.gameplayActive and not self.gameOverActive:
+                     observation_val = self._get_observation_for_ai()
+                     info_dict = {'lives': self.lives, 'score': self.score, 'is_round_cleared': True}
+                     # For this intermediate state, reward is 0, game is not "done" (game over).
+                     return observation_val, 0, False, info_dict
+            # If none of the above, game might be in an unexpected paused state. 
+            # For AI, we generally want to keep it moving or end the episode.
+            # If it's truly stuck, done_flag will eventually be caught by max_steps.
 
-
+        # --- If gameplay is active or just became active ---
         prev_score = self.score
         prev_lives = self.lives
 
@@ -803,28 +833,21 @@ class Game:
         elif action == config.ACTION_SHOOT: simulated_action_keys[pg.K_SPACE] = True
 
         if self.shipCurrentlyAlive and self.player:
-            original_x = self.player.rect.x # For player's own update method
             if simulated_action_keys[pg.K_LEFT]:
                 self.player.rect.x = max(10, self.player.rect.x - self.player.speed)
             if simulated_action_keys[pg.K_RIGHT]:
-                self.player.rect.x = min(config.SCREEN_WIDTH - self.player.rect.width - 10, self.player.rect.x + self.player.speed)
-            
-            # The Ship.update method also moves based on keys. To avoid double movement,
-            # we can either pass empty keys to Ship.update for AI, or ensure Ship.update is robust.
-            # For now, player is moved directly. Ship.update will blit it.
-            # To prevent Ship.update from moving it again based on pg.key.get_pressed(),
-            # self.keys should be None or all False when calling allSprites.update from step_ai.
-            # Or, Ship.update needs to take the AI's action_keys.
-
+                self.player.rect.x = min(config.SCREEN_WIDTH - self.player.rect.width - 10, 
+                                         self.player.rect.x + self.player.speed)
             if simulated_action_keys[pg.K_SPACE]:
                 self._handle_player_shooting()
         
-        current_time_update = pg.time.get_ticks()
-        if self.enemies: self.enemies.update(current_time_update)
+        current_time_update = pg.time.get_ticks() # Use a consistent time for all updates in this step
+
+        if self.enemies: 
+            self.enemies.update(current_time_update)
         
-        # For AI step, pass None as keys to allSprites.update so player ship isn't moved by its own update method again.
-        # Player was already moved above. Other sprites don't use keys.
-        # The Ship.update method should be robust to `keys` being None. (Modified Ship.update)
+        # For AI step, pass None as keys to allSprites.update.
+        # Player was already moved. Ship.update needs to be robust to keys=None.
         self.allSprites.update(None, current_time_update, self.screen)
         self.bullets.update(None, current_time_update, self.screen)
         self.enemyBullets.update(None, current_time_update, self.screen)
@@ -834,63 +857,103 @@ class Game:
         self._respawn_player_if_needed(current_time_update) # Uses self.player_respawn_delay
         self._trigger_enemy_shooting(current_time_update)
 
-        if self.enemies and self.enemies.bottom >= config.SCREEN_HEIGHT - 80 :
+        # Check for enemies reaching bottom (game over condition)
+        if self.enemies and self.enemies.bottom >= config.SCREEN_HEIGHT - 80:
             if self.shipCurrentlyAlive and self.player and pg.sprite.spritecollideany(self.player, self.enemies):
                 self._player_death() 
-            if self.enemies.bottom >= config.SCREEN_HEIGHT: # Check if self.enemies is not None
-                if not self.gameOverActive:
+            if self.enemies.bottom >= config.SCREEN_HEIGHT:
+                if not self.gameOverActive: # Ensure _player_death is called only once for this condition
                     self._player_death(final_death=True)
 
+        # --- Calculate reward and done status ---
         reward_val = (self.score - prev_score)
         if self.lives < prev_lives: 
-            reward_val -= 50
+            reward_val -= 50 # Penalty for losing a life
 
-        done_flag = self.gameOverActive
+        done_flag = self.gameOverActive # This is the primary "game over" condition
         
         round_cleared_this_step = False
-        if not self.enemies and not self.explosionsGroup and not done_flag:
-            if self.gameplayActive: # Was gameplay active before clearing?
-                round_cleared_this_step = True
-                reward_val += 100 
-                self.gameplayActive = False # Transition to "Next Round"
-                self.roundOverTimer = pg.time.get_ticks()
+        # Check if a round was just cleared AND the game is not already over
+        if not self.enemies and not self.explosionsGroup and not done_flag and self.gameplayActive:
+            # self.gameplayActive check ensures we were in active play before clearing.
+            # If round clear logic already set gameplayActive=False, this won't run again,
+            # which is intended. The roundOverTimer would have been set.
+            round_cleared_this_step = True
+            reward_val += 100 # Bonus for clearing a round
+            self.gameplayActive = False # Transition to "Next Round" pause state
+            self.roundOverTimer = pg.time.get_ticks() # Set timer for the (potentially zero) pause
 
         observation_val = self._get_observation_for_ai()
         info_dict = {'lives': self.lives, 'score': self.score, 'is_round_cleared': round_cleared_this_step}
         
-        # Clock tick: only if not in full-speed AI training mode OR if rendering is explicitly requested for this step
-        if not self.ai_training_mode or self._is_rendering_for_ai_this_step:
-            self.clock.tick(config.FPS)
-        # Reset the rendering flag for the next step_ai cycle
-        self._is_rendering_for_ai_this_step = False
+        # --- Clock Tick Logic ---
+        if self.headless_worker_mode:
+            # Headless workers in multiprocessing run as fast as possible.
+            # Pygame's internal timers still advance based on pg.time.get_ticks().
+            pass 
+        elif self._is_rendering_for_ai_this_step:
+            # If render_for_ai() was called in this conceptual frame (by train.py/test.py when args.render is True)
+            # Use a potentially higher FPS for faster visual training/testing.
+            self.clock.tick(getattr(config, 'AI_TRAIN_RENDER_FPS', 120)) # Use game.config
+        elif not self.ai_training_mode:
+            # If not in AI training mode at all (e.g., human play via run_player_mode, though this uses its own loop)
+            # or if step_ai was used for some other mode that needs standard FPS.
+            self.clock.tick(config.FPS) # Use game.config
+        # Else (self.ai_training_mode is True AND self._is_rendering_for_ai_this_step is False):
+        #   This means AI training is running headless (no render call from train.py/test.py).
+        #   Do NOT call clock.tick() to run at maximum computational speed.
+        #   This case is covered by the above conditions (headless_worker_mode or the other two failing).
 
+        self._is_rendering_for_ai_this_step = False # Reset for the next call to step_ai
 
         return observation_val, reward_val, done_flag, info_dict
 
     def _get_observation_for_ai(self):
-        # This should return the raw pixel data if screen is updated.
-        # If render_for_ai was just called, screen is up to date.
-        # If not, screen might be stale if sprites only draw in their update.
-        # The current step_ai calls allSprites.update which draws.
-        return pg.surfarray.array3d(self.screen) # Use self.screen directly
+        # If truly headless (no display.set_mode), this needs to draw to a specific surface.
+        # If display.set_mode was called (even with dummy driver), self.screen exists.
+        # All sprite updates blit to self.screen.
+        # If self.screen is a pg.Surface and not the display screen, this is fine.
+        
+        # If self.screen was a dummy surface, we need to manually draw everything to it here.
+        # However, the current structure where step_ai calls allSprites.update(..., self.screen)
+        # means self.screen (whether it's the display or an in-memory Surface) gets updated.
+        if self.screen: # Check if self.screen was initialized
+            return pg.surfarray.array3d(self.screen)
+        else: # Should not happen if __init__ always creates a surface or display
+            return np.zeros((config.SCREEN_HEIGHT, config.SCREEN_WIDTH, 3), dtype=np.uint8)
 
     def render_for_ai(self):
-        self._is_rendering_for_ai_this_step = True # Signal that rendering happened for clock management
+        if self.headless_worker_mode: # Workers should not render to physical display
+            # They might "render" to their internal self.screen for _get_observation_for_ai
+            # but no pg.display.update()
+            # The blitting happens in sprite updates to self.screen (in-memory surface for worker)
+            # So, this method might just be a pass for headless, or ensure self.screen is updated.
+            # Let's ensure self.screen is drawn onto for observation purposes.
+            self.screen.blit(self.background, (0,0))
+            current_time = pg.time.get_ticks()
+            self.allSprites.update(None, current_time, self.screen) # Update and blit to self.screen
+            self.bullets.update(None, current_time, self.screen)
+            self.enemyBullets.update(None, current_time, self.screen)
+            self.explosionsGroup.update(None, current_time, self.screen)
+            # Draw HUD to self.screen
+            self.scoreValueText = Text(config.GAME_FONT, 20, str(self.score), config.GREEN, 85, 5)
+            self.scoreLabelText.draw(self.screen)
+            self.scoreValueText.draw(self.screen)
+            self.livesLabelText.draw(self.screen)
+            return # No pg.display.update()
+        # Original rendering logic for non-headless
+        self._is_rendering_for_ai_this_step = True
         self.screen.blit(self.background, (0,0))
         current_time = pg.time.get_ticks()
-        
-        # For rendering AI, keys are not from human. Player is moved by AI.
-        # Pass None for keys to sprite updates.
         self.allSprites.update(None, current_time, self.screen)
         self.bullets.update(None, current_time, self.screen)
         self.enemyBullets.update(None, current_time, self.screen)
         self.explosionsGroup.update(None, current_time, self.screen)
-
         self.scoreValueText = Text(config.GAME_FONT, 20, str(self.score), config.GREEN, 85, 5)
         self.scoreLabelText.draw(self.screen)
         self.scoreValueText.draw(self.screen)
         self.livesLabelText.draw(self.screen)
-        pg.display.update()
+        pg.display.update() # Only update physical display if not headless worker
 
     def get_action_size(self):
         return config.NUM_ACTIONS

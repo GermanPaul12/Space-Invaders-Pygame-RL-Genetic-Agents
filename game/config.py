@@ -37,6 +37,7 @@ BLOCKERS_POSITION = 450
 ENEMY_DEFAULT_POSITION = 65  # Initial y value for enemies in a new game
 ENEMY_MOVE_DOWN = 35  # How much enemies move down when changing direction
 FPS = 60
+AI_TRAIN_RENDER_FPS = 240
 
 # Player settings
 PLAYER_SPEED = 5
