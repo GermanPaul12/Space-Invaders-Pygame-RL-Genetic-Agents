@@ -1,5 +1,7 @@
 # main.py (NEW interactive launcher)
 import subprocess
+# main.py (NEW interactive launcher)
+import subprocess
 import sys
 import os
 import json # For checking config files (optional, can be done by train.py)
@@ -218,5 +220,7 @@ def main_interactive():
             input("\nPress Enter to return to the AI Agent Menu...") # For all AI ops
     print("\nExiting launcher. Goodbye!")
 
+if __name__ == "__main__":
+    main_interactive()
 if __name__ == "__main__":
     main_interactive()
