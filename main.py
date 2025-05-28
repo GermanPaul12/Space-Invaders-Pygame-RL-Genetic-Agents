@@ -209,14 +209,14 @@ def main_interactive():
                             cmd_args[f"--{agent_name_config}_config_path"] = config_to_pass_for_agent
 
 
-                cmd_args["--episodes"] = int(input("Episodes/Generations (default 1000): ") or "1000")
-                cmd_args["--num_workers"] = int(input("Num workers for NEAT/GA (default cpu_count-1, min 1): ") or max(1, os.cpu_count() -1 if os.cpu_count() else 1))
-                cmd_args["--load_models"] = get_yes_no("Load LATEST models to continue training (if exist)?", default_yes=False)
+                cmd_args["--episodes"] = int(input("Episodes/Generations (default 50): ") or "50")
+                cmd_args["--num_workers"] = int(input("Num workers for NEAT/GA (default cpu_count//2, min 1): ") or max(1, os.cpu_count() // 2 if os.cpu_count() else 1))
+                cmd_args["--load_models"] = get_yes_no("Load LATEST models to continue training (if exist)?", default_yes=True)
                 if not cmd_args.get("--load_models", False): # Only ask force_train if not loading
                     cmd_args["--force_train"] = get_yes_no("Force training (create new version if model exists and not loading)?", default_yes=False)
-                cmd_args["--render"] = get_yes_no("Render game content during training?", default_yes=False)
-                cmd_args["--max_steps_per_episode"] = int(input("Max steps per episode/evaluation (default 2000): ") or "2000")
-                cmd_args["--save_interval"] = int(input("Save NN models every N episodes (GA/NEAT save per gen, default 50): ") or "50")
+                cmd_args["--render"] = get_yes_no("Render game content during training?", default_yes=True)
+                cmd_args["--max_steps_per_episode"] = int(input("Max steps per episode/evaluation (default 20000): ") or "20000")
+                cmd_args["--save_interval"] = int(input("Save NN models every N episodes (GA/NEAT save per gen, default 10): ") or "10")
                 cmd_args["--print_interval_steps"] = int(input("Print training stats every N steps (default 500): ") or "500")
 
 

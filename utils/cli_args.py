@@ -13,21 +13,21 @@ def add_common_training_args(parser):
     parser.add_argument("--agents", type=str, 
                         default=",".join(TRAINABLE_AGENTS_DEFAULT_LIST),
                         help=f"Comma-separated list of agents to train from: {', '.join(ALL_AGENT_TYPES_AVAILABLE)}")
-    parser.add_argument("--episodes", type=int, default=1000, 
+    parser.add_argument("--episodes", type=int, default=50, 
                         help="Episodes for NN agents; Generations for NEAT/Genetic.")
     parser.add_argument("--load_models", action='store_true', 
                         help="Load LATEST model to continue. Skips if no model unless --force_train.")
     parser.add_argument("--force_train", action='store_true',
                         help="Force new training (new versioned model) even if model(s) exist.")
     parser.add_argument("--render", action='store_true', help="Render game content during training.")
-    parser.add_argument("--max_steps_per_episode", type=int, default=2000,
+    parser.add_argument("--max_steps_per_episode", type=int, default=20000,
                         help="Max game steps per evaluation/episode.")
     parser.add_argument("--save_interval", type=int, default=50, 
                         help="Save NN models every N eps. Pop-based save per generation.")
     parser.add_argument("--print_interval_steps", type=int, default=500, 
                         help="Print stats every N steps within an episode.")
     parser.add_argument("--num_workers", type=int, 
-                        default=max(1, os.cpu_count() - 8 if os.cpu_count() and os.cpu_count() > 1 else 1),
+                        default=max(1, os.cpu_count() // 2 if os.cpu_count() and os.cpu_count() > 1 else 1),
                         help="Worker processes for parallel NEAT/GA evaluation.")
     return parser
 

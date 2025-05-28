@@ -151,7 +151,7 @@ REWARD_ROUND_CLEAR = 200
 REWARD_PER_STEP_ALIVE = 0.01 # Small positive reward for surviving each step
 
 # --- New Reward Shaping Constants ---
-PUNISHMENT_ACTION_NONE = -0.05      # Small penalty for doing nothing if enemies are present
+PUNISHMENT_ACTION_NONE = 0      # No penalty for doing nothing if enemies are present
 PUNISHMENT_SHOOT_MISS = -0.1        # Small penalty for shooting and missing
 PUNISHMENT_ENEMY_ADVANCE_BASE = -0.001 # Base penalty per enemy per step they are alive (encourages clearing)
 PUNISHMENT_ENEMY_PROXIMITY_SCALE = -0.005 # Multiplier for how close enemies are (applied to bottom-most enemy row)
