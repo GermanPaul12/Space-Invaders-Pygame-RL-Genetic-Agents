@@ -27,7 +27,7 @@ def add_common_training_args(parser):
     parser.add_argument("--print_interval_steps", type=int, default=500, 
                         help="Print stats every N steps within an episode.")
     parser.add_argument("--num_workers", type=int, 
-                        default=max(1, os.cpu_count() - 2 if os.cpu_count() and os.cpu_count() > 1 else 1),
+                        default=max(1, os.cpu_count() - 8 if os.cpu_count() and os.cpu_count() > 1 else 1),
                         help="Worker processes for parallel NEAT/GA evaluation.")
     return parser
 

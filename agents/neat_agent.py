@@ -301,7 +301,17 @@ class NEATAgent(Agent): # (As in your last correct version, accepting **kwargs)
         processed_obs_np = preprocess_observation(raw_observation, new_size=(self.processed_h, self.processed_w))
         flat_input = processed_obs_np.flatten()
         network_outputs = current_genome.feed_forward(flat_input)
-        return np.argmax(network_outputs)
+        
+        action = np.argmax(network_outputs)
+        # --- ADD THIS ---
+        if self.current_generation < 5 and self.current_genome_idx < 3: # Print for early phase
+            print(f"  Gen {self.current_generation} Genome {self.current_genome_idx} Outputs: {network_outputs}, Action: {action}")
+        # You'll need to pass step_count_in_episode or have the agent track it.
+        # Or just print for every action for a few genomes:
+        if self.current_genome_idx == 0 and self.current_generation % 5 == 0: # Print for genome 0 every 5 gens
+            print(f"  NEAT G{self.current_generation} I0 Outputs: {network_outputs} -> Act: {action}")
+        # --- END ADD ---
+        return action
 
     def record_fitness(self, score): # Called by train.py after worker evaluates a genome
         # This method now assumes train.py will assign fitness to self.population[some_index].fitness
