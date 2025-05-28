@@ -144,17 +144,14 @@ NUM_ACTIONS = 4
 # If ACTION_NONE is explicit: NUM_ACTIONS = 4
 
 # --- Rewards for AI ---
-REWARD_ENEMY_KILL = 10 
-REWARD_MYSTERY_KILL = 100
-REWARD_LIFE_LOST = -100 
-REWARD_ROUND_CLEAR = 200 
-REWARD_PER_STEP_ALIVE = 0.01 # Small positive reward for surviving each step
+REWARD_ENEMY_KILL = 50 # WAS 10. Now much higher. Make it a base multiplier, score will be added too.
+REWARD_MYSTERY_KILL = 100 # WAS 50.
+REWARD_LIFE_LOST = -100 # Keep penalty for dying significant.
+REWARD_ROUND_CLEAR = 300 # WAS 200.
+REWARD_PER_STEP_ALIVE = 0.001 # REDUCE this if it's making hiding too appealing. Or keep it small.
 
 # --- New Reward Shaping Constants ---
-PUNISHMENT_ACTION_NONE = 0      # No penalty for doing nothing if enemies are present
-PUNISHMENT_SHOOT_MISS = -0.1        # Small penalty for shooting and missing
-PUNISHMENT_ENEMY_ADVANCE_BASE = -0.001 # Base penalty per enemy per step they are alive (encourages clearing)
-PUNISHMENT_ENEMY_PROXIMITY_SCALE = -0.005 # Multiplier for how close enemies are (applied to bottom-most enemy row)
-                                        # Lower Y means closer, so (SCREEN_HEIGHT - enemy.rect.bottom) is smaller when closer
-                                        # We want larger penalty when closer, so maybe scale with 1 / (distance_to_danger_zone)
-                                        # Or, simpler: penalty increases as enemy_group.bottom increases.
+PUNISHMENT_ACTION_NONE = -0.1        # WAS -0.05. Slightly increase penalty for doing nothing.
+PUNISHMENT_SHOOT_MISS = -0.05       # WAS -0.1. Maybe slightly reduce miss penalty if kill reward is high.
+PUNISHMENT_ENEMY_ADVANCE_BASE = -0.005 # WAS -0.001. Increase base penalty per enemy alive.
+PUNISHMENT_ENEMY_PROXIMITY_SCALE = -0.01 # WAS -0.005. Increase penalty for close enemies.
