@@ -1,227 +1,222 @@
-# main.py
-import pygame as pg
-import argparse
+# main.py (NEW interactive launcher)
+import subprocess
 import sys
 import os
-import numpy as np # For observation shape for DQN etc.
+import json # For checking config files (optional, can be done by train.py)
 
-try:
-    from game import Game
-    import config
-    from agents.agent import Agent # Base class
-    from agents.random_agent import RandomAgent
-    from agents.dqn_agent import DQNAgent, preprocess_observation as dqn_preprocess
-    from agents.a2c_agent import A2CAgent, preprocess_observation as ac_preprocess
-    from agents.ppo_agent import PPOAgent, preprocess_observation as ppo_preprocess
-    from agents.genetic_agent import GeneticAgent, preprocess_observation as ga_preprocess
-except ImportError as e:
-    print(f"Error importing game or agent files: {e}")
-    print("Ensure all files are correctly placed and PyTorch is installed if needed.")
-    sys.exit(1)
+# --- Path Setup ---
+ROOT_DIR = os.path.dirname(os.path.abspath(__file__))
+GAME_PACKAGE_DIR = os.path.join(ROOT_DIR, "game")
+MODELS_DIR_MAIN = os.path.join(ROOT_DIR, "models") # CORRECTED to "models"
+AGENT_CONFIGS_DIR = os.path.join(ROOT_DIR, "configs")
+BASE_MODEL_FILENAME_TEMPLATE_MAIN = "{agent_name}_spaceinvaders"
 
-MODELS_DIR = "trained_models"
-if not os.path.exists(MODELS_DIR):
-    os.makedirs(MODELS_DIR)
+sys.path.insert(0, ROOT_DIR) # Add project root to path for 'from game.game import Game'
 
-def get_model_path(agent_name):
-    return os.path.join(MODELS_DIR, f"{agent_name}_spaceinvaders.pth")
+# --- Helper Functions ---
+def get_python_executable():
+    """Gets the currently running Python executable."""
+    return sys.executable
 
-def main():
-    parser = argparse.ArgumentParser(description="Space Invaders with Pygame and AI Agents")
-    parser.add_argument("--mode", type=str, choices=['play', 'train', 'test', 'evaluate_all'], default='play',
-                        help="Mode of operation.")
-    parser.add_argument("--agent", type=str, 
-                        choices=['human', 'random', 'dqn', 'ppo', 'a2c', 'genetic'], 
-                        default='human',
-                        help="Agent to use.")
-    parser.add_argument("--episodes", type=int, default=1000, help="Number of episodes for training/testing AI.")
-    parser.add_argument("--load_model", action='store_true', help="Load a pre-trained model for the agent.")
-    parser.add_argument("--render", action='store_true', help="Render game during AI training/testing.")
-    parser.add_argument("--max_steps_per_episode", type=int, default=2000, help="Max steps per episode for AI.")
-    parser.add_argument("--silent", action='store_true', help="Run the game without sounds.")
+def clear_screen():
+    """Clears the terminal screen."""
+    os.system('cls' if os.name == 'nt' else 'clear')
 
-
-    args = parser.parse_args()
-
-    game_instance = Game(silent_mode=args.silent)
-
-    if args.mode == 'play':
-        if args.agent != 'human':
-            print(f"Warning: 'play' mode selected, but agent is '{args.agent}'. Defaulting to human player.")
-        print("Starting game in human player mode...")
-        game_instance.run_player_mode()
-        pg.quit()
-        sys.exit()
-
-    # --- AI Mode Setup ---
-    print(f"Selected AI mode: {args.mode} with agent: {args.agent}")
-    if args.agent == 'human' and args.mode != 'play':
-        print("Error: 'human' agent cannot be used for AI modes.")
-        pg.quit()
-        sys.exit(1)
-
-    # Determine observation shape (after preprocessing for NNs)
-    # For simplicity, let's assume a fixed preprocessed shape (e.g., 1x84x84 for grayscale)
-    # This should match what the preprocessing functions output.
-    # Example: if dqn_preprocess outputs (1, 84, 84)
-    preprocessed_obs_shape = (1, 84, 84) # (C, H, W) - adjust if your preprocess changes this!
-
-    agent = None
-    agent_name = args.agent
-    model_path = get_model_path(agent_name)
-    action_size = game_instance.get_action_size()
-
-    if agent_name == 'random':
-        agent = RandomAgent(action_size)
-    elif agent_name == 'dqn':
-        # Args for DQN. Could be moved to config or agent-specific configs
-        agent = DQNAgent(action_size, preprocessed_obs_shape, 
-                         buffer_size=50000, batch_size=32, gamma=0.99, lr=1e-4, 
-                         target_update_freq=1000, eps_decay=100000) # Slower decay for more steps
-    elif agent_name == 'a2c':
-        agent = A2CAgent(action_size, preprocessed_obs_shape, lr=7e-4, gamma=0.99)
-    elif agent_name == 'ppo':
-        agent = PPOAgent(action_size, preprocessed_obs_shape, lr=2.5e-4, gamma=0.99, 
-                         trajectory_n_steps=256, ppo_epochs=4, mini_batch_size=64)
-    elif agent_name == 'genetic':
-        agent = GeneticAgent(action_size, preprocessed_obs_shape, population_size=20, num_elites=2, mutation_rate=0.1)
-    else:
-        print(f"Agent '{agent_name}' not implemented yet.")
-        pg.quit()
-        sys.exit(1)
-
-    if args.load_model and os.path.exists(model_path) and agent_name != 'random':
+def get_choice(prompt, options, allow_cancel=False, default_on_enter=None):
+    print(prompt)
+    for i, option in enumerate(options): print(f"{i+1}. {option}")
+    default_prompt_part = ""
+    if default_on_enter is not None and 1 <= default_on_enter <= len(options):
+        default_prompt_part = f" (default: {options[default_on_enter-1]})"
+    cancel_option_num = 0
+    if allow_cancel:
+        cancel_option_num = len(options) + 1
+        print(f"{cancel_option_num}. Cancel / Go Back")
+    while True:
         try:
-            agent.load(model_path)
-            print(f"Loaded pre-trained model for {agent_name} from {model_path}")
-        except Exception as e:
-            print(f"Could not load model for {agent_name}: {e}")
-    elif args.load_model and agent_name != 'random':
-        print(f"Model file not found for {agent_name} at {model_path}. Starting fresh.")
+            choice_str = input(f"Enter your choice (number){default_prompt_part}: ").strip()
+            if not choice_str and default_on_enter is not None: choice = default_on_enter
+            elif not choice_str and allow_cancel: return "cancel"
+            else: choice = int(choice_str)
+            if 1 <= choice <= len(options): return choice - 1
+            elif allow_cancel and choice == cancel_option_num: return "cancel"
+            else:
+                upper_bound = cancel_option_num if allow_cancel else len(options)
+                print(f"Invalid choice. Please enter between 1 and {upper_bound}.")
+        except ValueError: print("Invalid input. Please enter a number.")
+        except Exception: print("Unexpected input error.")
 
+def get_yes_no(prompt, default_yes=None):
+    options_str = " (yes/no)"
+    if default_yes is True: options_str = " (YES/no)"
+    elif default_yes is False: options_str = " (yes/NO)"
+    while True:
+        answer = input(f"{prompt}{options_str}: ").strip().lower()
+        if not answer and default_yes is not None: return default_yes
+        if answer in ['yes', 'y']: return True
+        elif answer in ['no', 'n']: return False
+        else: print("Invalid input. Enter 'yes' or 'no'.")
 
-    # --- Training / Testing / Evaluation Logic ---
-    
-    if args.mode == 'train':
-        print(f"--- Training {agent_name} for {args.episodes} episodes ---")
-        total_steps_overall = 0
-        for episode in range(args.episodes):
-            observation = game_instance.reset_for_ai()
-            episode_reward = 0
-            episode_loss = 0
-            num_learn_steps = 0
+def build_command(script_name, args_dict):
+    command = [get_python_executable(), "-u", script_name]
+    for arg, value in args_dict.items():
+        if isinstance(value, bool):
+            if value: command.append(arg)
+        elif value is not None:
+            command.append(arg); command.append(str(value))
+    return command
 
-            if agent_name == 'genetic':
-                print(f"Generation {episode // agent.population_size +1}, Individual {agent.current_individual_idx + 1}/{agent.population_size}")
+def run_command(command):
+    print(f"\nExecuting: {' '.join(command)}\n")
+    try:
+        process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1, universal_newlines=True)
+        for line in process.stdout: print(line, end='', flush=True)
+        process.wait()
+        if process.returncode != 0: print(f"\n--- CMD Error (code: {process.returncode}) ---")
+        else: print(f"\n--- CMD Success ---")
+    except FileNotFoundError: print(f"Error: Script '{command[1]}' not found in project root.")
+    except Exception as e: print(f"Subprocess error: {e}")
 
-            for step in range(args.max_steps_per_episode):
-                action = agent.choose_action(observation)
-                next_observation, reward, done, info = game_instance.step_ai(action)
-                episode_reward += reward
-                total_steps_overall +=1
+def get_existing_model_filenames_ui(agent_name):
+    # This function now relies on utils.model_helpers which uses the correct "models" dir name.
+    from utils.model_helpers import get_model_filenames_for_display
+    return get_model_filenames_for_display(agent_name) # model_helpers knows MODELS_DIR is "models"
 
-                # Learning step varies by agent
-                loss_val = None
-                if agent_name == 'dqn':
-                    agent.store_transition(observation, action, next_observation, reward, done)
-                    if total_steps_overall > agent.batch_size * 5 : # Start learning after some experience
-                         loss_val = agent.learn()
-                elif agent_name == 'a2c':
-                    agent.store_outcome(reward, done) # Store r, d for current action
-                    loss_val = agent.learn(next_observation if not done else None) # Pass next_obs for bootstrap
-                elif agent_name == 'ppo':
-                    # PPO store_transition_outcome will trigger learn internally when buffer is full or done
-                    loss_val = agent.store_transition_outcome(reward, done, next_observation)
-                # Genetic agent learns at the end of a generation (all individuals evaluated)
-                # Random agent doesn't learn
+# --- Main Interactive Loop ---
+def main_interactive():
+    if not os.path.exists(AGENT_CONFIGS_DIR):
+        print(f"Warning: Agent configuration directory '{AGENT_CONFIGS_DIR}' not found. Creating it.")
+        try:
+            os.makedirs(AGENT_CONFIGS_DIR)
+            print(f"Please place default JSON config files (e.g., dqn_default.json) in '{AGENT_CONFIGS_DIR}'.")
+        except OSError as e:
+            print(f"Error creating '{AGENT_CONFIGS_DIR}': {e}. Config loading might fail.")
+            input("Press Enter to continue anyway...")
 
-                if loss_val is not None:
-                    episode_loss += loss_val
-                    num_learn_steps += 1
-                
-                observation = next_observation
-                if args.render:
-                    game_instance.render_for_ai()
-                    pg.time.wait(1) # Small delay for human eyes
+    while True:
+        clear_screen()
+        print("Welcome to Space Invaders AI Launcher!")
+        print("======================================")
+        mode_options = ["Play as Human", "Run AI Agent", "Exit Launcher"]
+        mode_choice_result = get_choice("Select mode:", mode_options)
+        
+        if mode_choice_result is None or mode_choice_result == "cancel": # Handle potential None from get_choice
+            selected_mode = "Exit Launcher" # Default to exit if choice is strange
+        else:
+            selected_mode = mode_options[mode_choice_result]
 
-                if done:
-                    break
-            
-            avg_episode_loss = (episode_loss / num_learn_steps) if num_learn_steps > 0 else 0
-            print(f"Episode {episode + 1}: Reward={episode_reward}, Steps={step+1}, AvgLoss={avg_episode_loss:.4f}, Score={info.get('score',0)}")
+        if selected_mode == "Exit Launcher": break
+        elif selected_mode == "Play as Human":
+            print("\n--- Player Mode ---")
+            try:
+                from game.game import Game as GameClass
+                game_args = {'silent_mode': get_yes_no("Run game without sounds?", default_yes=False), 'ai_training_mode': False}
+                print("\nStarting game in player mode...")
+                game_instance = GameClass(**game_args)
+                game_instance.run_player_mode()
+            except ImportError: print("Error: Could not import Game class.")
+            except Exception as e: print(f"An error in player mode: {e}")
+            input("\nPress Enter to return to the main menu...")
 
-            if agent_name == 'genetic':
-                agent.record_fitness(info.get('score', 0)) # Use score as fitness
-                if agent.current_individual_idx >= agent.population_size:
-                    agent.learn() # Evolve population
+        elif selected_mode == "Run AI Agent":
+            clear_screen()
+            print("--- AI Agent Mode ---")
+            ai_op_options = ["Train Agent(s)", "Test/Run Specific Agent Version", "Evaluate All Agents (Latest Versions)", "Back to Main Menu"]
+            ai_op_choice_result = get_choice("\nSelect AI operation:", ai_op_options, allow_cancel=True) # Allow cancel here
+            if ai_op_choice_result is None or ai_op_choice_result == "cancel": continue
+            selected_ai_operation = ai_op_options[ai_op_choice_result]
 
-            # Save model periodically
-            if (episode + 1) % 50 == 0 and agent_name not in ['random', 'genetic']: # Genetic saves best at end of generation
-                agent.save(model_path)
-            if agent_name == 'genetic' and agent.current_individual_idx == 0 and episode > 0: # Start of new gen
-                 agent.save(model_path) # Save best of previous generation
+            # No need to set script_to_run default here, set it inside conditions
+            cmd_args = {}
+            agent_options_list = ["dqn", "ppo", "a2c", "genetic", "neat", "random"]
+            trainable_agents_for_prompt = [agent for agent in agent_options_list if agent != 'random']
 
-        # Final save
-        if agent_name not in ['random', 'genetic']:
-            agent.save(model_path)
-        elif agent_name == 'genetic': # Ensure best of last gen is saved
-            agent.save(model_path)
-
-
-    elif args.mode == 'test':
-        print(f"--- Testing {agent_name} for {args.episodes} episodes ---")
-        all_rewards = []
-        all_scores = []
-        for episode in range(args.episodes):
-            observation = game_instance.reset_for_ai()
-            episode_reward = 0
-            
-            if agent_name == 'genetic': # Test the current best or first individual if not trained
-                if not args.load_model: print("Warning: Testing GA without loading a model, using first individual.")
-
-            for step in range(args.max_steps_per_episode):
-                # For DQN/PPO/A2C in test mode, often epsilon is set to 0 or very low
-                if hasattr(agent, 'eps_start') and agent_name == 'dqn': # Simple way to force greedy for DQN
-                    original_eps_start = agent.eps_start
-                    agent.eps_start = 0.00 # Act greedily
-                    action = agent.choose_action(observation)
-                    agent.eps_start = original_eps_start # Restore
+            if selected_ai_operation == "Train Agent(s)":
+                script_to_run = "train.py"
+                print("\n--- Training Configuration ---")
+                agents_to_train_this_session = []
+                train_all_q = get_yes_no(f"Train all non-random agents ({', '.join(trainable_agents_for_prompt)})?", default_yes=True)
+                if train_all_q: agents_to_train_this_session = trainable_agents_for_prompt
                 else:
-                    action = agent.choose_action(observation)
+                    selected_agents_str = input(f"Enter comma-separated agent names to train (e.g., dqn,neat): ").strip()
+                    if selected_agents_str:
+                        agents_to_train_this_session = [s.strip().lower() for s in selected_agents_str.split(',') if s.strip().lower() in trainable_agents_for_prompt]
+                    if not agents_to_train_this_session: print("No valid agents. Aborting."); input("\nPress Enter..."); continue
+                cmd_args["--agents"] = ",".join(agents_to_train_this_session)
+
+                for agent_name_config in agents_to_train_this_session:
+                    default_config_name = f"{agent_name_config}_default.json"
+                    default_config_path = os.path.join(AGENT_CONFIGS_DIR, default_config_name)
+                    print(f"\nConfig for {agent_name_config.upper()}:")
+                    config_to_pass_for_agent = None # Initialize
+                    if os.path.exists(default_config_path):
+                        use_default = get_yes_no(f"Use default config '{default_config_name}'?", default_yes=True)
+                        config_to_pass_for_agent = default_config_path # Default to default
+                        if not use_default:
+                            custom_config_name = input(f"Enter filename for {agent_name_config} config (in '{AGENT_CONFIGS_DIR}/'): ").strip()
+                            if custom_config_name:
+                                custom_config_path = os.path.join(AGENT_CONFIGS_DIR, custom_config_name)
+                                if os.path.exists(custom_config_path): config_to_pass_for_agent = custom_config_path
+                                else: print(f"Warning: Custom config '{custom_config_name}' not found. Using default.")
+                        cmd_args[f"--{agent_name_config}_config_path"] = config_to_pass_for_agent
+                    else:
+                        print(f"Warning: Default config '{default_config_name}' not found. {agent_name_config.upper()} will use internal defaults.")
                 
-                next_observation, reward, done, info = game_instance.step_ai(action)
-                episode_reward += reward
-                observation = next_observation
+                cmd_args["--episodes"] = int(input("Episodes per agent/individual (default 1000): ") or "1000")
+                cmd_args["--load_models"] = get_yes_no("Load LATEST models to continue training?", default_yes=False)
+                if not cmd_args.get("--load_models", False):
+                    cmd_args["--force_train"] = get_yes_no("Force training (new version if model exists and not loading)?", default_yes=False)
+                cmd_args["--render"] = get_yes_no("Render game content?", default_yes=False)
+                cmd_args["--max_steps_per_episode"] = int(input("Max steps per episode (default 2000): ") or "2000")
+                cmd_args["--save_interval"] = int(input("Save NN models every N episodes (default 50, GA/NEAT per gen): ") or "50")
+                cmd_args["--print_interval_steps"] = int(input("Print stats every N steps (default 500): ") or "500")
 
-                if args.render:
-                    game_instance.render_for_ai()
-                    pg.time.wait(1)
-                if done:
-                    break
-            all_rewards.append(episode_reward)
-            all_scores.append(info.get('score',0))
-            print(f"Test Episode {episode + 1}: Reward={episode_reward}, Score={info.get('score',0)}")
-        print(f"--- Test Results for {agent_name} ---")
-        print(f"Average Reward: {np.mean(all_rewards):.2f} +/- {np.std(all_rewards):.2f}")
-        print(f"Average Score: {np.mean(all_scores):.2f} +/- {np.std(all_scores):.2f}")
+            elif selected_ai_operation == "Test/Run Specific Agent Version":
+                script_to_run = "test.py"
+                agent_choice_result = get_choice("\nSelect agent type:", agent_options_list, allow_cancel=True)
+                if agent_choice_result == "cancel" or agent_choice_result is None: continue
+                cmd_args["--agent"] = agent_options_list[agent_choice_result]
+                
+                model_file_to_load = None
+                if cmd_args["--agent"] != "random":
+                    available_versions = get_existing_model_filenames_ui(cmd_args["--agent"])
+                    if not available_versions:
+                        print(f"No models for {cmd_args['--agent']}.")
+                        if not get_yes_no(f"Run {cmd_args['--agent']} untrained?", default_yes=False): input("\nPress Enter..."); continue
+                        # No --model_file_path to pass, test.py will handle agent without loaded model
+                    else:
+                        print(f"\nModels for {cmd_args['--agent']}:")
+                        chosen_model_idx = get_choice("Select model:", available_versions, allow_cancel=True)
+                        if chosen_model_idx == "cancel" or chosen_model_idx is None: input("\nPress Enter..."); continue
+                        model_file_to_load = os.path.join(MODELS_DIR_MAIN, available_versions[chosen_model_idx])
+                        cmd_args["--model_file_path"] = model_file_to_load # test.py uses this
+                
+                cmd_args["--episodes"] = int(input(f"Episodes (default {'5' if model_file_to_load else '1'}): ") or ("5" if model_file_to_load else "1"))
+                cmd_args["--render"] = get_yes_no("Render game?", default_yes=True)
+                cmd_args["--max_steps_per_episode"] = int(input("Max steps (default 3000): ") or "3000")
+                cmd_args["--silent"] = get_yes_no("No sounds?", default_yes=True)
+                cmd_args["--gif_episodes"] = int(input("Record N initial episodes as GIF (0=disable, default 0): ") or "0")
+                if cmd_args.get("--gif_episodes", 0) > 0:
+                    cmd_args["--gif_fps"] = int(input("GIF FPS (default 15): ") or "15")
+                    cmd_args["--gif_capture_every_n_steps"] = int(input("GIF capture interval (default 4): ") or "4")
 
-    elif args.mode == 'evaluate_all':
-        print("--- Evaluating all trained agents ---")
-        # This would loop through a list of agent types, load their models, and run test mode
-        # For now, this is a placeholder for a more robust evaluation script.
-        # Example:
-        # agent_types_to_eval = ['dqn', 'ppo', 'a2c', 'genetic', 'random']
-        # for ag_type in agent_types_to_eval:
-        #     print(f"\nEvaluating {ag_type}...")
-        #     # Re-initialize or set up agent
-        #     # Load model for ag_type
-        #     # Run test loop (similar to above)
-        # This part needs careful implementation to manage agent instances and model loading.
-        print("Evaluate_all mode is not fully implemented yet. Run --mode test --agent <name> for individual tests.")
+            elif selected_ai_operation == "Evaluate All Agents (Latest Versions)":
+                script_to_run = "evaluate.py"
+                print("\n--- Evaluate All Configuration ---")
+                cmd_args["--episodes"] = int(input("Eval episodes per agent (default 20): ") or "20")
+                cmd_args["--max_steps_per_episode"] = int(input("Max steps (default 3000): ") or "3000")
+                cmd_args["--silent"] = True # Evaluation usually silent
+                cmd_args["--render"] = False # Evaluation usually headless
 
+            if script_to_run and cmd_args: # Ensure script_to_run is set
+                command_list = build_command(script_to_run, cmd_args)
+                run_command(command_list)
+            elif script_to_run: # No cmd_args but script selected (e.g. evaluate all with defaults)
+                 command_list = build_command(script_to_run, {})
+                 run_command(command_list)
+            
+            input("\nPress Enter to return to the AI Agent Menu...") # For all AI ops
+    print("\nExiting launcher. Goodbye!")
 
-    pg.quit()
-    sys.exit()
-
-if __name__ == '__main__':
-    main()
+if __name__ == "__main__":
+    main_interactive()
