@@ -2,5 +2,7 @@
     "lr": 0.0007,
     "gamma": 0.99,
     "entropy_coef": 0.01,
-    "value_loss_coef": 0.5
+    "value_loss_coef": 0.5,
+    "mini_batch_size": 64,
+    "a2c_epochs": 4
 }

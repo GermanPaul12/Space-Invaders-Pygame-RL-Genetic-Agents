@@ -144,9 +144,9 @@ NUM_ACTIONS = 4
 # If ACTION_NONE is explicit: NUM_ACTIONS = 4
 
 # --- Rewards for AI ---
-REWARD_ENEMY_KILL = 50 # WAS 10. Now much higher. Make it a base multiplier, score will be added too.
-REWARD_MYSTERY_KILL = 100 # WAS 50.
-REWARD_LIFE_LOST = -100 # Keep penalty for dying significant.
+REWARD_ENEMY_KILL = 100 # WAS 10. Now much higher. Make it a base multiplier, score will be added too.
+REWARD_MYSTERY_KILL = 150 # WAS 50.
+REWARD_LIFE_LOST = -150 # Keep penalty for dying significant.
 REWARD_ROUND_CLEAR = 500 # WAS 200.
 REWARD_PER_STEP_ALIVE = 0.001 # REDUCE this if it's making hiding too appealing. Or keep it small.
 
@@ -154,7 +154,7 @@ REWARD_UNDER_ENEMY = 0.02       # Small reward for being positioned under an ene
 ALIGNMENT_TOLERANCE_X = 10      # How close in X the player needs to be to an enemy column (logical units)
 
 # --- New Reward Shaping Constants ---
-PUNISHMENT_ACTION_NONE = -0.1        # WAS -0.05. Slightly increase penalty for doing nothing.
+PUNISHMENT_ACTION_NONE = -0.01        # WAS -0.05. Slightly increase penalty for doing nothing.
 PUNISHMENT_SHOOT_MISS = -0.05       # WAS -0.1. Maybe slightly reduce miss penalty if kill reward is high.
 PUNISHMENT_ENEMY_ADVANCE_BASE = -0.005 # WAS -0.001. Increase base penalty per enemy alive.
 PUNISHMENT_ENEMY_PROXIMITY_SCALE = -0.01 # WAS -0.005. Increase penalty for close enemies.
