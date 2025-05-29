@@ -1,8 +1,9 @@
 # main.py
-import multiprocessing
+# REMOVED: import multiprocessing 
 import subprocess
 import sys
 import os
+import json # For checking config files
 
 # --- Path Setup ---
 ROOT_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -13,13 +14,11 @@ BASE_MODEL_FILENAME_TEMPLATE_MAIN = "{agent_name}_spaceinvaders"
 
 sys.path.insert(0, ROOT_DIR) # Add project root to path
 
-# --- Helper Functions ---
+# --- Helper Functions (no changes needed here) ---
 def get_python_executable():
-    """Gets the currently running Python executable."""
     return sys.executable
 
 def clear_screen():
-    """Clears the terminal screen."""
     os.system('cls' if os.name == 'nt' else 'clear')
 
 def get_choice(prompt, options, allow_cancel=False, default_on_enter=None):
@@ -36,8 +35,8 @@ def get_choice(prompt, options, allow_cancel=False, default_on_enter=None):
         try:
             choice_str = input(f"Enter your choice (number){default_prompt_part}: ").strip()
             if not choice_str and default_on_enter is not None: choice = default_on_enter
-            elif not choice_str and allow_cancel: return "cancel" # if empty and cancel allowed, treat as cancel
-            elif not choice_str and not allow_cancel and default_on_enter is None: # if empty, no default, no cancel
+            elif not choice_str and allow_cancel: return "cancel"
+            elif not choice_str and not allow_cancel and default_on_enter is None:
                  print("Input required.")
                  continue
             else: choice = int(choice_str)
@@ -49,7 +48,6 @@ def get_choice(prompt, options, allow_cancel=False, default_on_enter=None):
                 print(f"Invalid choice. Please enter between 1 and {upper_bound}.")
         except ValueError: print("Invalid input. Please enter a number.")
         except Exception as e: print(f"Unexpected input error: {e}")
-
 
 def get_yes_no(prompt, default_yes=None):
     options_str = " (yes/no)"
@@ -74,24 +72,16 @@ def build_command(script_name, args_dict):
 def run_command(command):
     print(f"\nExecuting: {' '.join(command)}\n")
     try:
-        # Use Popen for real-time output
         process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1, universal_newlines=True)
-        for line in process.stdout: # Live output
-            print(line, end='', flush=True)
-        process.wait() # Wait for the process to complete
-        if process.returncode != 0:
-            print(f"\n--- CMD Error (Return Code: {process.returncode}) ---")
-        else:
-            print(f"\n--- CMD Success ---")
-    except FileNotFoundError:
-        print(f"Error: Script '{command[1]}' not found. Ensure it's in the project root.")
-    except Exception as e:
-        print(f"An error occurred while trying to run the command: {e}")
-
+        for line in process.stdout: print(line, end='', flush=True)
+        process.wait()
+        if process.returncode != 0: print(f"\n--- CMD Error (Return Code: {process.returncode}) ---")
+        else: print(f"\n--- CMD Success ---")
+    except FileNotFoundError: print(f"Error: Script '{command[1]}' not found. Ensure it's in the project root.")
+    except Exception as e: print(f"An error occurred while trying to run the command: {e}")
 
 def get_existing_model_filenames_ui(agent_name):
-    # This function now relies on utils.model_helpers which uses the correct "models" dir name.
-    from utils.model_helpers import get_model_filenames_for_display # model_helpers knows MODELS_DIR
+    from utils.model_helpers import get_model_filenames_for_display
     return get_model_filenames_for_display(agent_name) 
 
 # --- Main Interactive Loop ---
@@ -115,24 +105,23 @@ def main_interactive():
         print("Welcome to Space Invaders AI Launcher!")
         print("======================================")
         mode_options = ["Play as Human", "Run AI Agent", "Exit Launcher"]
-        mode_choice_result = get_choice("Select mode:", mode_options, default_on_enter=1) # Default to Play
+        mode_choice_result = get_choice("Select mode:", mode_options, default_on_enter=1)
         
         selected_mode_idx = mode_choice_result
-        if selected_mode_idx == "cancel" or selected_mode_idx is None : # Should not happen with default
+        if selected_mode_idx == "cancel" or selected_mode_idx is None : 
             selected_mode = "Exit Launcher" 
         else:
             selected_mode = mode_options[selected_mode_idx]
-
 
         if selected_mode == "Exit Launcher": break
         elif selected_mode == "Play as Human":
             print("\n--- Player Mode ---")
             try:
-                from game.game_manager import Game as GameClass # MODIFIED
+                from game.game_manager import Game as GameClass
                 game_args = {
                     'silent_mode': get_yes_no("Run game without sounds?", default_yes=False),
                     'ai_training_mode': False,
-                    'headless_worker_mode': False # Player mode is never headless
+                    'headless_worker_mode': False 
                 }
                 print("\nStarting game in player mode...")
                 game_instance = GameClass(**game_args)
@@ -147,16 +136,14 @@ def main_interactive():
             ai_op_options = ["Train Agent(s)", "Test/Run Specific Agent Version", "Evaluate All Agents (Latest Versions)", "Back to Main Menu"]
             ai_op_choice_result = get_choice("\nSelect AI operation:", ai_op_options, allow_cancel=True, default_on_enter=1) 
             
-            if ai_op_choice_result == "cancel" or ai_op_choice_result is None: continue # Back to main menu if cancelled
+            if ai_op_choice_result == "cancel" or ai_op_choice_result is None: continue
             selected_ai_operation = ai_op_options[ai_op_choice_result]
             if selected_ai_operation == "Back to Main Menu": continue
 
-
-            script_to_run = None # Initialize
+            script_to_run = None 
             cmd_args = {}
-            # ALL_AGENT_TYPES_AVAILABLE should be imported from utils.cli_args for consistency
             try:
-                from utils.cli_args import ALL_AGENT_TYPES_AVAILABLE
+                from utils.cli_args import ALL_AGENT_TYPES_AVAILABLE 
             except ImportError:
                 print("Warning: Could not import ALL_AGENT_TYPES_AVAILABLE. Using hardcoded list.")
                 ALL_AGENT_TYPES_AVAILABLE = ["dqn", "ppo", "a2c", "genetic", "neat", "random"]
@@ -173,7 +160,7 @@ def main_interactive():
                     selected_agents_str = input(f"Enter comma-separated agent names to train (e.g., dqn,neat) from [{', '.join(trainable_agents_for_prompt)}]: ").strip()
                     if selected_agents_str:
                         agents_to_train_this_session = [s.strip().lower() for s in selected_agents_str.split(',') if s.strip().lower() in trainable_agents_for_prompt]
-                    if not agents_to_train_this_session: print("No valid agents selected for training. Aborting operation."); input("\nPress Enter..."); continue
+                    if not agents_to_train_this_session: print("No valid agents selected. Aborting."); input("\nPress Enter..."); continue
                 cmd_args["--agents"] = ",".join(agents_to_train_this_session)
 
                 for agent_name_config in agents_to_train_this_session:
@@ -184,41 +171,40 @@ def main_interactive():
                     if os.path.exists(default_config_path):
                         use_default = get_yes_no(f"Use default config '{default_config_name}'?", default_yes=True)
                         if use_default: config_to_pass_for_agent = default_config_path
-                        else:
+                        else: 
                             custom_config_name = input(f"Enter filename for {agent_name_config} config (in '{AGENT_CONFIGS_DIR}/', or full path): ").strip()
                             if custom_config_name:
-                                # Check if it's a full path first
-                                if os.path.exists(custom_config_name):
-                                    config_to_pass_for_agent = custom_config_name
-                                else: # Assume it's a filename in AGENT_CONFIGS_DIR
+                                if os.path.exists(custom_config_name): config_to_pass_for_agent = custom_config_name
+                                else:
                                     custom_config_path_local = os.path.join(AGENT_CONFIGS_DIR, custom_config_name)
                                     if os.path.exists(custom_config_path_local): config_to_pass_for_agent = custom_config_path_local
-                                    else: print(f"Warning: Custom config '{custom_config_name}' not found. {agent_name_config.upper()} will use internal defaults or no config file if default was also skipped.")
-                        if config_to_pass_for_agent: # Only add arg if a path is chosen
+                                    else: print(f"Warning: Custom config '{custom_config_name}' not found. {agent_name_config.upper()} using internal defaults.")
+                        if config_to_pass_for_agent:
                              cmd_args[f"--{agent_name_config}_config_path"] = config_to_pass_for_agent
-                    else:
-                        print(f"Note: Default config '{default_config_name}' not found. {agent_name_config.upper()} will use internal defaults if no custom path is specified next.")
-                        custom_config_name = input(f"Optional: Enter filename for {agent_name_config} config (in '{AGENT_CONFIGS_DIR}/', or full path), or leave blank for internal defaults: ").strip()
-                        if custom_config_name:
+                    else: 
+                        print(f"Note: Default config '{default_config_name}' not found.")
+                        custom_config_name = input(f"Optional: Enter custom config for {agent_name_config} (in '{AGENT_CONFIGS_DIR}/', or full path), or blank for internal defaults: ").strip()
+                        if custom_config_name: 
                             if os.path.exists(custom_config_name): config_to_pass_for_agent = custom_config_name
                             else:
                                 custom_config_path_local = os.path.join(AGENT_CONFIGS_DIR, custom_config_name)
                                 if os.path.exists(custom_config_path_local): config_to_pass_for_agent = custom_config_path_local
                                 else: print(f"Warning: Custom config '{custom_config_name}' not found. Using internal defaults for {agent_name_config.upper()}.")
-                        if config_to_pass_for_agent: # Only add arg if a path is chosen
+                        if config_to_pass_for_agent:
                             cmd_args[f"--{agent_name_config}_config_path"] = config_to_pass_for_agent
-
+                        else:
+                             print(f"{agent_name_config.upper()} will use internal defaults.")
 
                 cmd_args["--episodes"] = int(input("Episodes/Generations (default 50): ") or "50")
-                cmd_args["--num_workers"] = int(input("Num workers for NEAT/GA (default cpu_count//2, min 1): ") or max(1, os.cpu_count() // 2 if os.cpu_count() else 1))
+                # REMOVED --num_workers prompt here, as it's removed from cli_args for training
+                
                 cmd_args["--load_models"] = get_yes_no("Load LATEST models to continue training (if exist)?", default_yes=True)
-                if not cmd_args.get("--load_models", False): # Only ask force_train if not loading
-                    cmd_args["--force_train"] = get_yes_no("Force training (create new version if model exists and not loading)?", default_yes=False)
-                cmd_args["--render"] = get_yes_no("Render game content during training?", default_yes=True)
-                cmd_args["--max_steps_per_episode"] = int(input("Max steps per episode/evaluation (default 20000): ") or "20000")
-                cmd_args["--save_interval"] = int(input("Save NN models every N episodes (GA/NEAT save per gen, default 10): ") or "10")
+                if not cmd_args.get("--load_models", False):
+                    cmd_args["--force_train"] = get_yes_no("Force training (new version if model exists and not loading)?", default_yes=False)
+                cmd_args["--render"] = get_yes_no("Render game content during training?", default_yes=False) 
+                cmd_args["--max_steps_per_episode"] = int(input("Max steps per episode/evaluation (default 20000): ") or "20000") 
+                cmd_args["--save_interval"] = int(input("Save NN models every N episodes (GA/NEAT save per gen, default 10): ") or "10") 
                 cmd_args["--print_interval_steps"] = int(input("Print training stats every N steps (default 500): ") or "500")
-
 
             elif selected_ai_operation == "Test/Run Specific Agent Version":
                 script_to_run = "test.py"
@@ -231,69 +217,45 @@ def main_interactive():
                     available_versions = get_existing_model_filenames_ui(cmd_args["--agent"])
                     if not available_versions:
                         print(f"No trained models found for {cmd_args['--agent'].upper()}.")
-                        if not get_yes_no(f"Run {cmd_args['--agent'].upper()} untrained (randomly initialized)?", default_yes=False): 
-                            input("\nPress Enter to return to AI Menu..."); continue
-                        # No --model_file_path to pass, test.py will handle agent without loaded model
+                        if not get_yes_no(f"Run {cmd_args['--agent'].upper()} untrained?", default_yes=False): 
+                            input("\nPress Enter..."); continue
                     else:
-                        print(f"\nAvailable models for {cmd_args['--agent'].upper()}:")
-                        # Default to latest model (last in list)
+                        print(f"\nModels for {cmd_args['--agent'].upper()}:")
                         default_model_choice_ui = len(available_versions) 
-                        chosen_model_idx = get_choice("Select model to test:", available_versions, allow_cancel=True, default_on_enter=default_model_choice_ui)
-                        
-                        if chosen_model_idx == "cancel" or chosen_model_idx is None: 
-                            input("\nPress Enter to return to AI Menu..."); continue
-                        
-                        # Construct full path to model. model_helpers.get_model_filenames_for_display returns basenames.
-                        # MODELS_DIR_MAIN is the correct base path for models.
+                        chosen_model_idx = get_choice("Select model:", available_versions, allow_cancel=True, default_on_enter=default_model_choice_ui)
+                        if chosen_model_idx == "cancel" or chosen_model_idx is None: input("\nPress Enter..."); continue
                         model_file_to_load = os.path.join(MODELS_DIR_MAIN, available_versions[chosen_model_idx])
                         cmd_args["--model_file_path"] = model_file_to_load 
                 
-                cmd_args["--episodes"] = int(input(f"Number of episodes to run (default {'5' if model_file_to_load or cmd_args['--agent'] == 'random' else '1'}): ") or ("5" if model_file_to_load or cmd_args['--agent'] == 'random' else "1"))
-                cmd_args["--render"] = get_yes_no("Render game during testing?", default_yes=True)
-                cmd_args["--max_steps_per_episode"] = int(input("Max steps per episode (default 3000): ") or "3000")
-                cmd_args["--silent"] = get_yes_no("Run game without sounds?", default_yes=True)
-                
-                record_gif = get_yes_no("Record GIFs of initial episodes?", default_yes=False)
+                cmd_args["--episodes"] = int(input(f"Episodes (default {'5' if model_file_to_load or cmd_args['--agent'] == 'random' else '1'}): ") or ("5" if model_file_to_load or cmd_args['--agent'] == 'random' else "1"))
+                cmd_args["--render"] = get_yes_no("Render game?", default_yes=True)
+                cmd_args["--max_steps_per_episode"] = int(input("Max steps (default 100000): ") or "100000")
+                cmd_args["--silent"] = get_yes_no("No sounds?", default_yes=True)
+                record_gif = get_yes_no("Record GIFs?", default_yes=False)
                 if record_gif:
-                    cmd_args["--gif_episodes"] = int(input("Number of initial episodes to record as GIF (default 1, 0 to disable): ") or "1")
+                    cmd_args["--gif_episodes"] = int(input("Record N initial episodes as GIF (0=disable, default 1): ") or "1")
                     if cmd_args.get("--gif_episodes", 0) > 0:
                         cmd_args["--gif_fps"] = int(input("GIF FPS (default 15): ") or "15")
-                        cmd_args["--gif_capture_every_n_steps"] = int(input("GIF frame capture interval (steps, default 4): ") or "4")
+                        cmd_args["--gif_capture_every_n_steps"] = int(input("GIF capture interval (default 4): ") or "4")
                         cmd_args["--max_gif_frames"] = int(input("Max frames per GIF segment (default 500): ") or "500")
-                else:
-                    cmd_args["--gif_episodes"] = 0
-
+                else: cmd_args["--gif_episodes"] = 0
 
             elif selected_ai_operation == "Evaluate All Agents (Latest Versions)":
                 script_to_run = "evaluate.py"
-                print("\n--- Evaluate All Latest Agents Configuration ---")
-                cmd_args["--episodes"] = int(input("Evaluation episodes per agent (default 20): ") or "20")
-                cmd_args["--max_steps_per_episode"] = int(input("Max steps per episode (default 3000): ") or "3000")
-                # Evaluation is typically silent and headless for speed.
+                print("\n--- Evaluate All Configuration ---")
+                cmd_args["--episodes"] = int(input("Eval episodes per agent (default 20): ") or "20")
+                cmd_args["--max_steps_per_episode"] = int(input("Max steps (default 3000): ") or "3000")
                 cmd_args["--silent"] = True 
                 cmd_args["--render"] = False 
-                # No GIF recording for bulk evaluation.
 
-            if script_to_run: # Check if a script was actually selected
+            if script_to_run: 
                 command_list = build_command(script_to_run, cmd_args)
                 run_command(command_list)
-            # No else needed, as "Back to Main Menu" is handled by 'continue'
             
             input("\nPress Enter to return to the AI Agent Menu...") 
     
     print("\nExiting Space Invaders AI Launcher. Goodbye!")
 
 if __name__ == "__main__":
-    # Set multiprocessing start method to 'spawn' if on Windows or macOS,
-    # as Pygame and other libraries might not be fork-safe.
-    # This is better done in the main entry point (here) than in train.py's __main__
-    # to cover all potential subprocess uses if other scripts also used multiprocessing.
-    if sys.platform.startswith('win') or sys.platform.startswith('darwin'):
-        if multiprocessing.get_start_method(allow_none=True) != 'spawn':
-            try:
-                multiprocessing.set_start_method('spawn', force=True)
-                # print("INFO: Multiprocessing start method set to 'spawn'.") # Optional info
-            except RuntimeError:
-                # This can happen if context is already set or if force=True isn't enough.
-                pass # Silently pass if it fails, hoping for the best or relying on script-specific settings.
+    # REMOVED multiprocessing.set_start_method block as multiprocessing is no longer used by train.py
     main_interactive()

@@ -147,11 +147,60 @@ NUM_ACTIONS = 4
 REWARD_ENEMY_KILL = 50 # WAS 10. Now much higher. Make it a base multiplier, score will be added too.
 REWARD_MYSTERY_KILL = 100 # WAS 50.
 REWARD_LIFE_LOST = -100 # Keep penalty for dying significant.
-REWARD_ROUND_CLEAR = 300 # WAS 200.
+REWARD_ROUND_CLEAR = 500 # WAS 200.
 REWARD_PER_STEP_ALIVE = 0.001 # REDUCE this if it's making hiding too appealing. Or keep it small.
+
+REWARD_UNDER_ENEMY = 0.02       # Small reward for being positioned under an enemy
+ALIGNMENT_TOLERANCE_X = 10      # How close in X the player needs to be to an enemy column (logical units)
 
 # --- New Reward Shaping Constants ---
 PUNISHMENT_ACTION_NONE = -0.1        # WAS -0.05. Slightly increase penalty for doing nothing.
 PUNISHMENT_SHOOT_MISS = -0.05       # WAS -0.1. Maybe slightly reduce miss penalty if kill reward is high.
 PUNISHMENT_ENEMY_ADVANCE_BASE = -0.005 # WAS -0.001. Increase base penalty per enemy alive.
 PUNISHMENT_ENEMY_PROXIMITY_SCALE = -0.01 # WAS -0.005. Increase penalty for close enemies.
+
+# --- Constants for NumPy Game Engine (Headless Logic-Only) ---
+LOGICAL_GRID_WIDTH = 80         # Abstract units for game width
+LOGICAL_GRID_HEIGHT = 60        # Abstract units for game height
+
+PLAYER_START_X_LOGICAL = LOGICAL_GRID_WIDTH // 2
+PLAYER_START_Y_LOGICAL = LOGICAL_GRID_HEIGHT - 5
+PLAYER_SPEED_LOGICAL = 1        # Movement units per step
+PLAYER_HITBOX_RADIUS_LOGICAL = 1 # Simplified hitbox
+
+ENEMY_START_Y_LOGICAL = 5
+ENEMY_ROWS_LOGICAL = 5
+ENEMY_COLUMNS_LOGICAL = 10
+ENEMY_SPACING_X_LOGICAL = (LOGICAL_GRID_WIDTH - 20) / ENEMY_COLUMNS_LOGICAL # Adjust as needed
+ENEMY_SPACING_Y_LOGICAL = 2
+ENEMY_SPEED_X_LOGICAL = 0.5
+ENEMY_SPEED_Y_LOGICAL = 1     # When stepping down
+ENEMY_HITBOX_RADIUS_LOGICAL = 1
+ENEMY_MOVE_INTERVAL_LOGICAL = 20 # Move every N steps (adjust for desired speed)
+ENEMY_SHOOT_PROBABILITY_LOGICAL = 0.01 # Per enemy, per step they can shoot
+
+PLAYER_BULLET_SPEED_LOGICAL = 2
+ENEMY_BULLET_SPEED_LOGICAL = 1.5
+BULLET_HITBOX_RADIUS_LOGICAL = 0.5
+
+BLOCKER_NUM_SEGMENTS_X_LOGICAL = 8 # Per blocker structure
+BLOCKER_NUM_SEGMENTS_Y_LOGICAL = 3
+BLOCKER_HEALTH_INITIAL_LOGICAL = 3 # Hits it can take
+
+MYSTERY_SHIP_SPEED_LOGICAL = 1.5
+MYSTERY_SHIP_Y_LOGICAL = 3
+MYSTERY_SHIP_APPEAR_CHANCE_LOGICAL = 0.005 # Chance per step to appear if not active
+
+# Observation Grid for NumPy engine (if using grid-based obs)
+OBSERVATION_GRID_WIDTH_NP = 20  # Number of cells horizontally
+OBSERVATION_GRID_HEIGHT_NP = 20 # Number of cells vertically
+# Entity IDs for the observation grid
+ENTITY_ID_EMPTY = 0
+ENTITY_ID_PLAYER = 1
+ENTITY_ID_ENEMY_TYPE_0 = 2 # Bottom row type
+ENTITY_ID_ENEMY_TYPE_1 = 3 # Middle row type
+ENTITY_ID_ENEMY_TYPE_2 = 4 # Top row type
+ENTITY_ID_PLAYER_BULLET = 5
+ENTITY_ID_ENEMY_BULLET = 6
+ENTITY_ID_BLOCKER = 7
+ENTITY_ID_MYSTERY = 8

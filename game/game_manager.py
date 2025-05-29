@@ -378,7 +378,7 @@ class Game:
     
     def step_ai(self, action):
         current_time_step = pg.time.get_ticks()
-        screen_for_sprite_updates = None 
+        screen_for_sprite_updates = None # Sprites update logic, don't blit in their update
 
         # --- AI Inter-Round Logic (before primary game step logic) ---
         if not self.gameplayActive and not self.gameOverActive:
@@ -388,41 +388,53 @@ class Game:
                 if current_time_step - self.roundOverTimer < self.inter_round_delay:
                     self.nextRoundTextDisplay.draw(self.screen)
             
-            if current_time_step - self.roundOverTimer >= self.inter_round_delay: # Time to transition
+            # Logic to transition to next round or game over
+            if current_time_step - self.roundOverTimer >= self.inter_round_delay:
                 self.enemy_start_y = min(self.enemy_start_y + config.ENEMY_MOVE_DOWN_NEW_ROUND, 
                                          config.BLOCKERS_POSITION - (config.ENEMY_ROWS*config.ENEMY_Y_SPACING)-20)
-                max_y = config.BLOCKERS_POSITION - (config.ENEMY_ROWS*config.ENEMY_Y_SPACING)-10
-                if self.enemy_start_y >= max_y: self.gameOverActive = True 
-                else: self._reset_round_state(self.score); self.gameplayActive = True
+                max_y = config.BLOCKERS_POSITION - (config.ENEMY_ROWS*config.ENEMY_Y_SPACING)-10 # Max allowable start y
+                if self.enemy_start_y >= max_y: 
+                    self.gameOverActive = True 
+                else: 
+                    self._reset_round_state(self.score)
+                    self.gameplayActive = True
             
             if not self.gameplayActive: # Still not active (waiting for delay or became game over)
+                # For observation, ensure the state is drawn if it's a non-display-render step
                 obs = self._get_observation_for_ai() 
-                reward = 0; done = self.gameOverActive
+                reward = 0.0
+                done = self.gameOverActive
                 info = {'lives':self.lives,'score':self.score,'is_round_cleared': not self.enemies and not self.explosionsGroup and not done}
                 
+                # If rendering this inter-round/game-over step, ensure display is updated
                 if not self.headless_worker_mode and self._is_rendering_for_ai_this_step:
                     if self.gameOverActive: # If became game over this step, draw game over screen
-                        self.screen.blit(self.background, (0,0)) # Ensure clean slate before game over text
+                        # Screen might have been cleared above, or clear again if needed
+                        self.screen.blit(self.background, (0,0)) 
                         self._draw_game_over_elements(current_time_step)
+                    # If it was just "Next Round" text, it was drawn above.
                     if pg.display.get_init() and pg.display.get_surface(): pg.display.update()
                 
                 self._is_rendering_for_ai_this_step = False 
                 return obs, reward, done, info
-        # --- End AI Inter-Round Logic ---
-
-        # --- Gameplay Active Logic for AI ---
-        prev_score = self.score; prev_lives = self.lives
+        
+        prev_score = self.score
+        prev_lives = self.lives 
         player_shot_this_step = False
 
-        if self.shipCurrentlyAlive and self.player:
-            if action == config.ACTION_LEFT: self.player.rect.x = max(config.PLAYER_MIN_X, self.player.rect.x - self.player.speed)
-            elif action == config.ACTION_RIGHT: self.player.rect.x = min(config.PLAYER_MAX_X - self.player.rect.width, self.player.rect.x + self.player.speed)
+        # --- Apply AI Action & Update Game Logic ---
+        if self.shipCurrentlyAlive and self.player: # Use shipCurrentlyAlive
+            if action == config.ACTION_LEFT: 
+                self.player.rect.x = max(config.PLAYER_MIN_X, self.player.rect.x - self.player.speed)
+            elif action == config.ACTION_RIGHT: 
+                self.player.rect.x = min(config.PLAYER_MAX_X - self.player.rect.width, self.player.rect.x + self.player.speed)
             elif action == config.ACTION_SHOOT:
-                num_bullets_before = len(self.bullets)
+                num_bullets_before_shot = len(self.bullets)
                 self._handle_player_shooting()
-                if len(self.bullets) > num_bullets_before: player_shot_this_step = True
+                if len(self.bullets) > num_bullets_before_shot:
+                    player_shot_this_step = True
         
-        # Update sprite logic (no drawing here)
+        # Update sprite logic (no drawing directly in these update calls)
         if self.player: self.playerGroup.update(None, current_time_step, screen_for_sprite_updates)
         if self.enemies: self.enemies.update(current_time_step) 
         self.bullets.update(None, current_time_step, screen_for_sprite_updates)
@@ -435,43 +447,82 @@ class Game:
         self._check_collisions_and_deaths() 
         score_increase_from_kills = self.score - score_before_collisions
 
-        self._respawn_player_if_needed(current_time_step)
+        self._respawn_player_if_needed(current_time_step) # This method correctly uses/updates self.shipCurrentlyAlive
         self._trigger_enemy_shooting(current_time_step)
         
         if self.enemies and self.enemies.bottom >= config.SCREEN_HEIGHT - config.PLAYER_AREA_HEIGHT:
-            if self.shipCurrentlyAlive and self.player and pg.sprite.spritecollideany(self.player, self.enemies): self._player_death()
-            if self.enemies.bottom >= config.SCREEN_HEIGHT and not self.gameOverActive: self._player_death(final_death=True)
+            if self.shipCurrentlyAlive and self.player and pg.sprite.spritecollideany(self.player, self.enemies): # Use shipCurrentlyAlive
+                self._player_death()
+            if self.enemies.bottom >= config.SCREEN_HEIGHT and not self.gameOverActive: 
+                self._player_death(final_death=True)
         
-        # Reward calculation
-        reward = score_increase_from_kills 
-        if self.lives < prev_lives: reward += config.REWARD_LIFE_LOST
-        done = self.gameOverActive
-        round_cleared = False
-        if not self.enemies and not self.explosionsGroup and not done and self.gameplayActive:
-            round_cleared = True; reward += config.REWARD_ROUND_CLEAR 
+        # --- Calculate Reward & Done Status ---
+        reward = 0.0 
+        reward += score_increase_from_kills 
+        if self.lives < prev_lives: 
+            reward += config.REWARD_LIFE_LOST
+
+        round_cleared_this_step = False
+        if not self.enemies and not self.explosionsGroup and not self.gameOverActive and self.gameplayActive:
+            round_cleared_this_step = True
+            reward += config.REWARD_ROUND_CLEAR 
             self.gameplayActive = False; self.roundOverTimer = current_time_step
-        if not done: reward += config.REWARD_PER_STEP_ALIVE
-        if action == config.ACTION_NONE and self.enemies and len(self.enemies.sprites()) > 0: reward += config.PUNISHMENT_ACTION_NONE
-        if player_shot_this_step and score_increase_from_kills <= 0 : reward += config.PUNISHMENT_SHOOT_MISS
+
+        if not self.gameOverActive: 
+            reward += config.REWARD_PER_STEP_ALIVE
+
+        if action == config.ACTION_NONE and self.enemies and len(self.enemies.sprites()) > 0:
+            reward += config.PUNISHMENT_ACTION_NONE
+        
+        if player_shot_this_step and score_increase_from_kills <= 0 : 
+            reward += config.PUNISHMENT_SHOOT_MISS
+
+        # --- REWARD FOR BEING UNDER ENEMY ---
+        is_under_enemy = False
+        if self.shipCurrentlyAlive and self.player and self.enemies and len(self.enemies.sprites()) > 0: # Use shipCurrentlyAlive
+            player_center_x = self.player.rect.centerx
+            for enemy in self.enemies.sprites(): 
+                if abs(player_center_x - enemy.rect.centerx) < config.ALIGNMENT_TOLERANCE_X \
+                   and self.player.rect.top > enemy.rect.bottom: 
+                    is_under_enemy = True
+                    break 
+            if is_under_enemy:
+                reward += config.REWARD_UNDER_ENEMY
+        # --- END REWARD FOR BEING UNDER ENEMY ---
+
         if self.enemies and len(self.enemies.sprites()) > 0:
             reward += config.PUNISHMENT_ENEMY_ADVANCE_BASE * len(self.enemies.sprites())
-            max_penalty_y_start = config.SCREEN_HEIGHT / 2 
-            if self.enemies.bottom > max_penalty_y_start:
-                progress = (self.enemies.bottom - max_penalty_y_start) / (config.SCREEN_HEIGHT - max_penalty_y_start)
-                reward += config.PUNISHMENT_ENEMY_PROXIMITY_SCALE * progress
+            if hasattr(self.enemies, 'bottom'):
+                max_penalty_range_y_start = config.SCREEN_HEIGHT / 2 
+                if self.enemies.bottom > max_penalty_range_y_start:
+                    denominator = (config.SCREEN_HEIGHT - max_penalty_range_y_start)
+                    if denominator <= 0: denominator = 1 
+                    progress_into_danger = (self.enemies.bottom - max_penalty_range_y_start) / denominator
+                    reward += config.PUNISHMENT_ENEMY_PROXIMITY_SCALE * max(0, min(1, progress_into_danger)) 
+        
+        done = self.gameOverActive
 
-        # --- AI Frame Drawing (if rendering this step) ---
+        # ... (Drawing logic, _get_observation_for_ai, display update, _is_rendering_for_ai_this_step reset as before) ...
         if not self.headless_worker_mode and self._is_rendering_for_ai_this_step:
-            self._draw_main_game_frame(current_time_step)
+            # Ensure screen is cleared and UI drawn before sprites
+            self.screen.blit(self.background, (0,0)) 
+            self.scoreValueText = Text(config.GAME_FONT, 20, str(self.score), config.GREEN, 
+                                       self.scoreLabelText.rect.right + 5, 5) 
+            self.scoreLabelText.draw(self.screen); self.scoreValueText.draw(self.screen)
+            self.livesLabelText.draw(self.screen)
+            # livesSpritesGroup is part of allSprites
+            self.allSprites.draw(self.screen) 
 
         obs = self._get_observation_for_ai() 
-        info = {'lives':self.lives,'score':self.score,'is_round_cleared':round_cleared}
+        info = {'lives':self.lives,'score':self.score,'is_round_cleared':round_cleared_this_step}
         
         if not self.headless_worker_mode and self._is_rendering_for_ai_this_step:
             self.clock.tick(config.AI_TRAIN_RENDER_FPS)
-            if pg.display.get_init() and pg.display.get_surface(): pg.display.update()
+            if pg.display.get_init() and pg.display.get_surface(): 
+                pg.display.update() 
         
-        self._is_rendering_for_ai_this_step = False
+        self._is_rendering_for_ai_this_step = False 
+        
         return obs, reward, done, info
 
     def _get_observation_for_ai(self):

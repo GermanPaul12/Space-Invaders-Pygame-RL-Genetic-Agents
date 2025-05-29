@@ -1,5 +1,5 @@
 {
-    "population_size": 50,
+    "population_size": 20,
     "compatibility_threshold": 3.0,
     "excess_coef": 1.0,
     "disjoint_coef": 1.0,
