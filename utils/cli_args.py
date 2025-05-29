@@ -24,7 +24,7 @@ def add_common_training_args(parser):
                         help="Save NN models every N eps. Pop-based save per generation.")
     parser.add_argument("--print_interval_steps", type=int, default=500, 
                         help="Print stats every N steps within an episode.")
-    # REMOVED: --num_workers argument as NEAT/GA are serial in train.py
+    parser.add_argument("--silent_training", action='store_true', help="Run training without sounds (even if rendering).")
     return parser
 
 def add_agent_config_path_args(parser):

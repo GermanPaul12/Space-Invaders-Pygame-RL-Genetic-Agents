@@ -139,6 +139,13 @@ def train_all_agents():
     print_f(f"Load LATEST models: {args.load_models}")
     print_f(f"Force train (new version): {args.force_train}")
     print_f(f"Render game content: {args.render}")
+    effective_silent_mode = not args.render # Default: silent if not rendering
+    if args.render:
+        # If rendering, be silent only if --silent_training is explicitly passed
+        effective_silent_mode = args.silent_training 
+        print_f(f"Sounds during rendered training: {not effective_silent_mode}")
+    else:
+        print_f(f"Running headless (no sound, no visuals for main training loop).")
     print_f(f"Max steps per episode/eval: {args.max_steps_per_episode}")
     print_f(f"Save interval (NNs): {args.save_interval} episodes")
     print_f(f"Print interval (steps): {args.print_interval_steps}")
@@ -146,9 +153,9 @@ def train_all_agents():
     print_f("---------------------------------")
 
     game_instance_main = Game(
-        silent_mode=not args.render, 
+        silent_mode=effective_silent_mode, # Use the calculated effective_silent_mode
         ai_training_mode=True, 
-        headless_worker_mode=not args.render 
+        headless_worker_mode=not args.render # headless if not rendering on display
     )
     preprocessed_obs_shape = (1, 84, 84) 
     action_size = game_instance_main.get_action_size()

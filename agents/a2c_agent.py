@@ -63,6 +63,14 @@ class A2CAgent(Agent):
         self.dones = []
         self.action_logits_buffer = [] # To store logits for entropy calculation
 
+    
+    def _clear_buffers(self): # Ensure this method is defined like this
+        self.log_probs.clear()
+        self.state_values.clear()
+        self.rewards.clear()
+        self.dones.clear()
+        self.action_logits_buffer.clear()
+    
     def choose_action(self, raw_observation):
         state_np = preprocess_observation(raw_observation, new_size=(self.processed_h, self.processed_w))
         state_tensor = torch.from_numpy(state_np).float().unsqueeze(0).to(self.device)
@@ -108,57 +116,116 @@ class A2CAgent(Agent):
         self.dones.append(done)
 
     def learn(self, raw_next_observation=None): 
-        if not self.log_probs:
+        if self.is_evaluating or not self.log_probs: 
+            self._clear_buffers() 
             return None
 
-        R = 0
-        if not self.dones[-1] and raw_next_observation is not None:
+        # --- Check for NaNs in collected data BEFORE processing ---
+        for i, lp in enumerate(self.log_probs):
+            if torch.isnan(lp).any() or torch.isinf(lp).any():
+                print(f"A2C LEARN DEBUG: NaN/Inf in self.log_probs[{i}]: {lp}")
+                self._clear_buffers(); return None
+        for i, sv in enumerate(self.state_values):
+            if torch.isnan(sv).any() or torch.isinf(sv).any():
+                print(f"A2C LEARN DEBUG: NaN/Inf in self.state_values[{i}]: {sv}")
+                self._clear_buffers(); return None
+        for i, r in enumerate(self.rewards):
+            if np.isnan(r) or np.isinf(r): # rewards are Python floats/ints
+                print(f"A2C LEARN DEBUG: NaN/Inf in self.rewards[{i}]: {r}")
+                self._clear_buffers(); return None
+        for i, alogit in enumerate(self.action_logits_buffer):
+            if torch.isnan(alogit).any() or torch.isinf(alogit).any():
+                print(f"A2C LEARN DEBUG: NaN/Inf in self.action_logits_buffer[{i}]: {alogit}")
+                self._clear_buffers(); return None
+        # --- End NaN check for collected data ---
+
+        R = 0.0 
+        if not self.dones[-1] and raw_next_observation is not None: 
             next_state_p_np = preprocess_observation(raw_next_observation, new_size=(self.processed_h, self.processed_w))
             next_state_tensor = torch.from_numpy(next_state_p_np).float().unsqueeze(0).to(self.device)
-            with torch.no_grad(): # V(s_next) is a target, so no grad needed through it
+            with torch.no_grad(): 
+                original_mode = self.network.training # Store original mode
+                self.network.eval() 
                 _, R_tensor = self.network(next_state_tensor)
+                self.network.train(original_mode) # Restore original mode
+            
+            if torch.isnan(R_tensor).any() or torch.isinf(R_tensor).any():
+                print(f"A2C LEARN DEBUG: NaN/Inf in R_tensor (bootstrap value): {R_tensor}")
+                self._clear_buffers(); return None
             R = R_tensor.item()
+        
+        policy_discounted_returns = []
+        for r_val, d_val in zip(reversed(self.rewards), reversed(self.dones)): # Use different var names
+            if d_val: R = 0.0 
+            R = r_val + self.gamma * R # r_val is already a float from the buffer
+            policy_discounted_returns.insert(0, R)
+        
+        if not policy_discounted_returns: # Should not happen if self.log_probs was not empty
+            print("A2C LEARN DEBUG: policy_discounted_returns is empty!")
+            self._clear_buffers(); return None
 
-        policy_returns = []
-        for r, d in zip(reversed(self.rewards), reversed(self.dones)):
-            if d: R = 0
-            R = r + self.gamma * R
-            policy_returns.insert(0, R)
+        returns_t = torch.tensor(policy_discounted_returns, device=self.device, dtype=torch.float32)
         
-        policy_returns_t = torch.tensor(policy_returns, device=self.device, dtype=torch.float32)
-        
+        # Ensure buffers are not empty before cat
+        if not self.log_probs: self._clear_buffers(); return None # Should have been caught earlier
         log_probs_t = torch.cat(self.log_probs) 
-        state_values_t = torch.cat(self.state_values).squeeze(-1) # Squeeze the last dim (N,1) -> (N,)
+        if not self.state_values: self._clear_buffers(); return None
+        state_values_t = torch.cat(self.state_values).squeeze(-1) 
+        if not self.action_logits_buffer: self._clear_buffers(); return None
         action_logits_t = torch.cat(self.action_logits_buffer)
 
-
-        # Ensure consistent 1D tensors if N=1 (batch size of 1 step)
         if state_values_t.ndim == 0: state_values_t = state_values_t.unsqueeze(0)
-        if policy_returns_t.ndim == 0: policy_returns_t = policy_returns_t.unsqueeze(0)
+        if returns_t.ndim == 0: returns_t = returns_t.unsqueeze(0)
         if log_probs_t.ndim == 0: log_probs_t = log_probs_t.unsqueeze(0)
-        # action_logits_t will be (N, num_actions), which is fine for Categorical
 
-        advantages = policy_returns_t - state_values_t
+        # --- Check for NaNs before loss calculation ---
+        if torch.isnan(returns_t).any() or torch.isinf(returns_t).any(): print(f"A2C LEARN DEBUG: NaN/Inf in returns_t: {returns_t}"); self._clear_buffers(); return None
+        if torch.isnan(log_probs_t).any() or torch.isinf(log_probs_t).any(): print(f"A2C LEARN DEBUG: NaN/Inf in log_probs_t: {log_probs_t}"); self._clear_buffers(); return None
+        if torch.isnan(state_values_t).any() or torch.isinf(state_values_t).any(): print(f"A2C LEARN DEBUG: NaN/Inf in state_values_t: {state_values_t}"); self._clear_buffers(); return None
+        if torch.isnan(action_logits_t).any() or torch.isinf(action_logits_t).any(): print(f"A2C LEARN DEBUG: NaN/Inf in action_logits_t: {action_logits_t}"); self._clear_buffers(); return None
+        # --- End NaN check ---
+
+        advantages = returns_t - state_values_t         
         actor_loss = -(log_probs_t * advantages.detach()).mean()
-        critic_loss = F.mse_loss(state_values_t, policy_returns_t)
+        critic_loss = F.mse_loss(state_values_t, returns_t)
+        entropy_term = torch.tensor(0.0, device=self.device) # Default
+        try:
+            if not (torch.isnan(action_logits_t).any() or torch.isinf(action_logits_t).any()):
+                m_entropy = Categorical(logits=action_logits_t)
+                entropy_term = m_entropy.entropy().mean()
+            else:
+                 print(f"A2C LEARN DEBUG: Skipped entropy due to NaN/Inf in action_logits_t")
+        except ValueError as e_cat_entropy:
+            print(f"A2C LEARN CRITICAL: ValueError for entropy Categorical. Logits: {action_logits_t}. E: {e_cat_entropy}")
 
-        # Entropy calculation
-        m_entropy = Categorical(logits=action_logits_t)
-        entropy_term = m_entropy.entropy().mean()
 
         total_loss = actor_loss + self.value_loss_coef * critic_loss - self.entropy_coef * entropy_term
 
-        self.optimizer.zero_grad()
-        total_loss.backward()
-        torch.nn.utils.clip_grad_norm_(self.network.parameters(), 0.5)
-        self.optimizer.step()
+        if torch.isnan(total_loss).any() or torch.isinf(total_loss).any():
+            print(f"A2C LEARN DEBUG: NaN/Inf in total_loss. Actor: {actor_loss.item() if not (torch.isnan(actor_loss).any() or torch.isinf(actor_loss).any()) else 'NaN/Inf'}, Critic: {critic_loss.item() if not (torch.isnan(critic_loss).any() or torch.isinf(critic_loss).any()) else 'NaN/Inf'}, Entropy: {entropy_term.item() if not (torch.isnan(entropy_term).any() or torch.isinf(entropy_term).any()) else 'NaN/Inf'}")
+            self._clear_buffers() 
+            return None 
 
-        self.log_probs = []
-        self.state_values = []
-        self.rewards = []
-        self.dones = []
-        self.action_logits_buffer = [] # Clear logits buffer
-        
+        self.optimizer.zero_grad()
+        try:
+            total_loss.backward()
+        except RuntimeError as e_backward: # Catch specific RuntimeError
+            print(f"A2C LEARN CRITICAL: RuntimeError during total_loss.backward(): {e_backward}")
+            print(f"  Loss components: Actor={actor_loss}, Critic={critic_loss}, Entropy={entropy_term}")
+            print(f"  Network parameters may have NaNs. Checking first few layer weights:")
+            for name, param in self.network.named_parameters():
+                if param.grad is None and param.requires_grad: # Grads not computed yet, check weights
+                    if torch.isnan(param.data).any() or torch.isinf(param.data).any():
+                        print(f"    WARNING: NaN/Inf in weights of layer: {name}")
+                elif param.grad is not None: # Check computed gradients
+                    if torch.isnan(param.grad).any() or torch.isinf(param.grad).any():
+                        print(f"    WARNING: NaN/Inf in gradients of layer: {name}")
+            self._clear_buffers()
+            return None # Stop this learning update
+            
+        torch.nn.utils.clip_grad_norm_(self.network.parameters(), 0.5) 
+        self.optimizer.step()
+        self._clear_buffers()
         return total_loss.item()
 
     def save(self, path):

@@ -196,12 +196,13 @@ def main_interactive():
                              print(f"{agent_name_config.upper()} will use internal defaults.")
 
                 cmd_args["--episodes"] = int(input("Episodes/Generations (default 50): ") or "50")
-                # REMOVED --num_workers prompt here, as it's removed from cli_args for training
                 
                 cmd_args["--load_models"] = get_yes_no("Load LATEST models to continue training (if exist)?", default_yes=True)
                 if not cmd_args.get("--load_models", False):
                     cmd_args["--force_train"] = get_yes_no("Force training (new version if model exists and not loading)?", default_yes=False)
                 cmd_args["--render"] = get_yes_no("Render game content during training?", default_yes=False) 
+                if cmd_args["--render"]: # Only ask about sound if rendering
+                    cmd_args["--silent_training"] = get_yes_no("Run rendered training without sounds?", default_yes=False)
                 cmd_args["--max_steps_per_episode"] = int(input("Max steps per episode/evaluation (default 20000): ") or "20000") 
                 cmd_args["--save_interval"] = int(input("Save NN models every N episodes (GA/NEAT save per gen, default 10): ") or "10") 
                 cmd_args["--print_interval_steps"] = int(input("Print training stats every N steps (default 500): ") or "500")
@@ -257,5 +258,4 @@ def main_interactive():
     print("\nExiting Space Invaders AI Launcher. Goodbye!")
 
 if __name__ == "__main__":
-    # REMOVED multiprocessing.set_start_method block as multiprocessing is no longer used by train.py
     main_interactive()
