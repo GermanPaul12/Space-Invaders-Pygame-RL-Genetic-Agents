@@ -1,4 +1,5 @@
 # agents/ppo_agent.py
+import random
 import numpy as np
 import torch
 import torch.nn as nn
@@ -82,32 +83,74 @@ class PPOAgent(Agent):
         state_p_np = preprocess_observation(raw_observation, new_size=(self.processed_h, self.processed_w))
         state_tensor = torch.from_numpy(state_p_np).float().unsqueeze(0).to(self.device)
         
+        log_prob_item = -1e8 # Default for safety if action selection fails
+        action_item = 0      # Default action
+
         with torch.no_grad():
+            self.network.eval() # Set network to eval mode for consistent outputs
             action_logits, state_value = self.network(state_tensor)
-        
-        # --- DEBUG: Check logits from network before Categorical ---
+            if not self.is_evaluating: # If training, set back to train mode
+                 self.network.train()
+
+
         if torch.isnan(action_logits).any() or torch.isinf(action_logits).any():
-            print(f"PPO CHOOSE_ACTION DEBUG: NaN/Inf in action_logits from network: {action_logits}")
-        # --- END DEBUG ---
+            print(f"PPO CHOOSE_ACTION DEBUG: NaN/Inf in action_logits: {action_logits}")
+            action_item = random.randrange(self.action_size) # Fallback random action
+            # log_prob remains default small value
+        else:
+            try:
+                m = Categorical(logits=action_logits)
+                if self.is_evaluating: # Greedy action for evaluation
+                    action = torch.argmax(action_logits, dim=1)
+                else: # Sample during training
+                    action = m.sample()
+                log_prob = m.log_prob(action) # Calculate log_prob for chosen action
+                log_prob_item = log_prob.item()
+                action_item = action.item()
+            except ValueError as e:
+                print(f"PPO CHOOSE_ACTION CRITICAL: ValueError creating Categorical. Logits: {action_logits}. Error: {e}")
+                action_item = random.randrange(self.action_size) # Fallback
 
-        try:
-            m = Categorical(logits=action_logits)
-            action = m.sample()
-            log_prob = m.log_prob(action)
-        except ValueError as e:
-            print(f"PPO CHOOSE_ACTION CRITICAL: ValueError creating Categorical. Logits: {action_logits}. Error: {e}")
-            # Fallback to a random action if logits are problematic
-            action = torch.randint(0, self.action_size, (1,), device=self.device)
-            log_prob = torch.tensor(-1e8, device=self.device) # A very small log_prob
+        # Only store data needed for learning if in training mode
+        if not self.is_evaluating:
+            self._temp_action_data = {
+                'state': state_p_np, 
+                'action': action_item,
+                'log_prob': log_prob_item, 
+                'value': state_value.item() 
+            }
+        return action_item
+    
+    # ... (store_transition_outcome, _compute_gae, learn, save, load as before) ...
+    # Make sure _compute_gae and learn methods are robust to potentially empty/small buffers if
+    # store_transition_outcome isn't called as frequently during pure evaluation.
+    # The current learn is called from store_transition_outcome, so it's fine.
+    def store_transition_outcome(self, reward, done, raw_next_observation):
+        if self.is_evaluating: # Don't store or learn during pure evaluation
+            return None
 
-        self._temp_action_data = {
-            'state': state_p_np, 
-            'action': action.item(),
-            'log_prob': log_prob.item(),
-            'value': state_value.item() # state_value comes from critic
-        }
-        return action.item()
-
+        scaled_reward = reward / REWARD_SCALING_FACTOR
+        self.buffer['states'].append(self._temp_action_data['state'])
+        self.buffer['actions'].append(self._temp_action_data['action'])
+        self.buffer['log_probs'].append(self._temp_action_data['log_prob'])
+        self.buffer['values'].append(self._temp_action_data['value']) 
+        self.buffer['rewards'].append(scaled_reward) 
+        self.buffer['dones'].append(done)
+        self.current_buffer_size += 1
+        loss = None 
+        if self.current_buffer_size >= self.trajectory_n_steps or done:
+            last_value = 0.0 
+            if not done and raw_next_observation is not None:
+                next_state_p_np = preprocess_observation(raw_next_observation, new_size=(self.processed_h, self.processed_w))
+                next_state_tensor = torch.from_numpy(next_state_p_np).float().unsqueeze(0).to(self.device)
+                with torch.no_grad():
+                    self.network.eval() # Ensure eval mode for this prediction
+                    _, last_val_tensor = self.network(next_state_tensor)
+                    self.network.train() # Revert to train mode
+                last_value = last_val_tensor.item()
+            loss = self.learn(last_value) 
+            self._clear_buffer()
+        return loss 
     def store_transition_outcome(self, reward, done, raw_next_observation):
         # Scale reward before storing
         scaled_reward = reward / REWARD_SCALING_FACTOR
