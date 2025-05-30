@@ -4,6 +4,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import random
+from copy import deepcopy
 from .agent import Agent
 from .dqn_agent import preprocess_observation # Reuse preprocessing
 
@@ -55,6 +56,7 @@ class GeneticAgent(Agent):
         self.fitness_scores = np.zeros(population_size)
         self.current_individual_idx = 0
         self.best_fitness_overall = -float('inf') # Track best fitness across generations
+        self.best_individual_overall_state_dict = None # Store state_dict of the best individual overall
 
     def get_current_individual(self):
         return self.population[self.current_individual_idx]
@@ -78,31 +80,39 @@ class GeneticAgent(Agent):
         self.current_individual_idx += 1
 
     def learn(self):
-        if self.current_individual_idx < self.population_size:
-            print(f"GA: Waiting for all individuals to be evaluated. {self.current_individual_idx}/{self.population_size} done.")
-            return
+        if not np.any(self.fitness_scores) and self.current_individual_idx < self.population_size : # Check if any scores are actually set
+             print(f"GA: Waiting for all individuals to be evaluated. {self.current_individual_idx}/{self.population_size} done based on internal counter.")
+             # This condition might not be hit if train.py manages current_individual_idx to pop_size before calling learn
+             return
 
-        print(f"GA Generation finished. Max fitness in gen: {np.max(self.fitness_scores)}, Avg fitness: {np.mean(self.fitness_scores)}, Best overall: {self.best_fitness_overall}")
-        
+        # --- UPDATE BEST OVERALL FITNESS BASED ON CURRENT GENERATION ---
+        current_gen_max_fitness = np.max(self.fitness_scores)
+        if current_gen_max_fitness > self.best_fitness_overall:
+            self.best_fitness_overall = current_gen_max_fitness
+            best_idx_this_gen = np.argmax(self.fitness_scores)
+            # Store the state_dict of the best individual overall for saving
+            self.best_individual_overall_state_dict = deepcopy(self.population[best_idx_this_gen].state_dict())
+        # --- END UPDATE ---
+
+        print(f"GA Generation finished. Max fitness in gen: {current_gen_max_fitness:.2f}, Avg fitness: {np.mean(self.fitness_scores):.2f}, Best overall: {self.best_fitness_overall:.2f}")
         new_population = []
-        
+        # Elitism
         elite_indices = np.argsort(self.fitness_scores)[-self.num_elites:]
         for idx in elite_indices:
-            # Create a new network and load state_dict for elites to avoid issues with shared references if not careful
             elite_model = GeneticNetwork(self.input_channels, self.action_size, h=self.processed_h, w=self.processed_w).to(self.device)
             elite_model.load_state_dict(self.population[idx].state_dict())
             new_population.append(elite_model)
 
-
+        # Crossover and Mutation
         num_offspring = self.population_size - self.num_elites
-        for _ in range(num_offspring // 2):
+        for _ in range(num_offspring // 2): # Create two children per pair of parents
+            if len(new_population) >= self.population_size: break
             parent1 = self._tournament_selection()
             parent2 = self._tournament_selection()
 
+            child1_params, child2_params = parent1.state_dict(), parent2.state_dict() # Default to no crossover
             if random.random() < self.crossover_rate:
                 child1_params, child2_params = self._crossover(parent1.state_dict(), parent2.state_dict())
-            else:
-                child1_params, child2_params = parent1.state_dict(), parent2.state_dict()
 
             child1 = GeneticNetwork(self.input_channels, self.action_size, h=self.processed_h, w=self.processed_w).to(self.device)
             child1.load_state_dict(self._mutate(child1_params))
@@ -113,15 +123,17 @@ class GeneticAgent(Agent):
                 child2.load_state_dict(self._mutate(child2_params))
                 new_population.append(child2)
         
-        while len(new_population) < self.population_size: # Fill remaining spots if population_size is odd
-            parent = self._tournament_selection()
+        # Fill remaining spots if population_size is odd or offspring count wasn't exact
+        while len(new_population) < self.population_size:
+            parent = self._tournament_selection() # Select one parent
             child = GeneticNetwork(self.input_channels, self.action_size, h=self.processed_h, w=self.processed_w).to(self.device)
-            child.load_state_dict(self._mutate(parent.state_dict()))
+            # Mutate a clone of the parent's parameters
+            child.load_state_dict(self._mutate(deepcopy(parent.state_dict())))
             new_population.append(child)
 
         self.population = new_population
-        self.fitness_scores = np.zeros(self.population_size)
-        self.current_individual_idx = 0
+        self.fitness_scores = np.zeros(self.population_size) # Reset for next generation
+        self.current_individual_idx = 0 # Reset for next generation's evaluations
         print("GA: New generation created.")
 
 
@@ -169,28 +181,49 @@ class GeneticAgent(Agent):
         return mutated_params
     
     def save(self, path):
-        if np.any(self.fitness_scores) or self.current_individual_idx > 0 : # If any fitness recorded for current gen
-            best_idx_current_gen = np.argmax(self.fitness_scores[:self.current_individual_idx]) if self.current_individual_idx > 0 else 0
-            # Check if this best is truly the overall best if saving mid-generation for some reason
-            # Typically save is called after a full generation, where np.argmax(self.fitness_scores) is fine
-            best_individual = self.population[best_idx_current_gen]
-            torch.save(best_individual.state_dict(), path)
-            print(f"Best GA individual (fitness: {self.fitness_scores[best_idx_current_gen]:.2f}) saved to {path}")
-        elif self.population: # If no scores, but population exists (e.g. before first eval), save first one
-            torch.save(self.population[0].state_dict(), path)
-            print(f"GA: Saved first individual (no fitness scores yet) to {path}")
+        # Save the best individual encountered so far across all generations
+        if self.best_individual_overall_state_dict is not None:
+            torch.save(self.best_individual_overall_state_dict, path)
+            print(f"Best GA individual overall (fitness: {self.best_fitness_overall:.2f}) saved to {path}")
+        elif self.population: # Fallback: if no overall best tracked, save best of current or first
+            # This part may not be hit if best_individual_overall_state_dict is always maintained
+            current_gen_best_idx = 0
+            if np.any(self.fitness_scores): # If current gen has scores
+                current_gen_best_idx = np.argmax(self.fitness_scores)
+            best_individual_to_save = self.population[current_gen_best_idx]
+            torch.save(best_individual_to_save.state_dict(), path)
+            fitness_to_print = self.fitness_scores[current_gen_best_idx] if np.any(self.fitness_scores) else "N/A"
+            print(f"GA: Saved current best/first individual (fitness: {fitness_to_print}) to {path}")
         else:
             print("GA: No individuals to save.")
 
 
     def load(self, path):
-        loaded_state_dict = torch.load(path, map_location=self.device)
-        self.population = []
-        for _ in range(self.population_size):
-            individual = GeneticNetwork(self.input_channels, self.action_size, h=self.processed_h, w=self.processed_w).to(self.device)
-            individual.load_state_dict(loaded_state_dict)
-            self.population.append(individual)
-        self.current_individual_idx = 0
-        self.fitness_scores = np.zeros(self.population_size)
-        self.best_fitness_overall = -float('inf') # Reset best overall as we loaded a specific model
-        print(f"GA population initialized with model from {path}")
+        # When loading, we are essentially starting a new evolutionary run seeded by this individual.
+        # The loaded individual's fitness isn't directly transferred to best_fitness_overall yet.
+        # best_fitness_overall will be updated as this new population is evaluated.
+        try:
+            loaded_state_dict = torch.load(path, map_location=self.device)
+            self.population = []
+            for _ in range(self.population_size):
+                individual = GeneticNetwork(self.input_channels, self.action_size, h=self.processed_h, w=self.processed_w).to(self.device)
+                individual.load_state_dict(loaded_state_dict)
+                self.population.append(individual)
+            
+            self.current_individual_idx = 0
+            self.fitness_scores = np.zeros(self.population_size)
+            # Reset best_fitness_overall; it will be re-established by the new evaluations.
+            self.best_fitness_overall = -float('inf') 
+            self.best_individual_overall_state_dict = None # Also reset this
+            print(f"GA population initialized with model from {path}. Best overall fitness will be re-evaluated.")
+        except Exception as e:
+            print(f"Error loading GA model from {path}: {e}. Initializing new random population.")
+            # Re-initialize population if load fails
+            self.population = [
+                GeneticNetwork(self.input_channels, self.action_size, h=self.processed_h, w=self.processed_w).to(self.device)
+                for _ in range(self.population_size)
+            ]
+            self.current_individual_idx = 0
+            self.fitness_scores = np.zeros(self.population_size)
+            self.best_fitness_overall = -float('inf')
+            self.best_individual_overall_state_dict = None

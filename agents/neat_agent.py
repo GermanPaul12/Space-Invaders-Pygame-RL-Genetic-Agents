@@ -271,11 +271,19 @@ class NEATAgent(Agent): # (As in your last correct version, accepting **kwargs)
         self.interspecies_mate_rate = kwargs.get("interspecies_mate_rate", 0.001)
         self.elitism_species_percent = kwargs.get("elitism_species_percent", 0.1) # Elites from best species
         self.elitism_genome_percent_in_species = kwargs.get("elitism_genome_percent_in_species", 0.1) # Elites within a species
-        self.initial_connection_type = kwargs.get("initial_connection_type", "minimal")
+        self.initial_connection_type = kwargs.get("initial_connection_type", "full")
         self.output_activation = kwargs.get("output_activation", "tanh")
         self.hidden_activation = kwargs.get("hidden_activation", "tanh")
         self.ff_passes = kwargs.get("ff_passes", 3)
         self.allow_recurrent_connections_on_mutate = kwargs.get("allow_recurrent_connections_on_mutate", False) # Default to False for simpler initial networks
+
+        self.explore_gens_random = kwargs.get("explore_gens_random", 3)       # NEW: Generations for purely random actions
+        self.explore_gens_stochastic = kwargs.get("explore_gens_stochastic", 5) # Total gens for any exploration (random then stochastic)
+        self.action_explore_temp = kwargs.get("action_explore_temp", 1.0)
+        if self.action_explore_temp <= 0: self.action_explore_temp = 1e-6
+        # Ensure stochastic exploration doesn't overlap incorrectly with random
+        if self.explore_gens_stochastic <= self.explore_gens_random:
+            self.explore_gens_stochastic = self.explore_gens_random + 2 # Ensure stochastic phase is after random
 
         self.num_inputs = observation_shape[1] * observation_shape[2]
         self.num_outputs = action_size
@@ -297,20 +305,52 @@ class NEATAgent(Agent): # (As in your last correct version, accepting **kwargs)
         return self.hidden_activation
 
     def choose_action(self, raw_observation):
+        if self.current_genome_idx >= len(self.population) or self.current_genome_idx < 0:
+            return random.randrange(self.action_size) 
+
         current_genome = self.population[self.current_genome_idx]
-        processed_obs_np = preprocess_observation(raw_observation, new_size=(self.processed_h, self.processed_w))
-        flat_input = processed_obs_np.flatten()
-        network_outputs = current_genome.feed_forward(flat_input)
-        
-        action = np.argmax(network_outputs)
-        # --- ADD THIS ---
-        if self.current_generation < 5 and self.current_genome_idx < 3: # Print for early phase
-            print(f"  Gen {self.current_generation} Genome {self.current_genome_idx} Outputs: {network_outputs}, Action: {action}")
-        # You'll need to pass step_count_in_episode or have the agent track it.
-        # Or just print for every action for a few genomes:
-        if self.current_genome_idx == 0 and self.current_generation % 5 == 0: # Print for genome 0 every 5 gens
-            print(f"  NEAT G{self.current_generation} I0 Outputs: {network_outputs} -> Act: {action}")
-        # --- END ADD ---
+        action = 0 
+
+        # self.is_evaluating is set by episode_runner for test/eval runs
+        if self.is_evaluating: # Always greedy (use network) if in pure evaluation/test mode
+            processed_obs_np = preprocess_observation(raw_observation, new_size=(self.processed_h, self.processed_w))
+            flat_input = processed_obs_np.flatten()
+            network_outputs = np.array(current_genome.feed_forward(flat_input), dtype=np.float64)
+            action = np.argmax(network_outputs)
+        elif self.current_generation < self.explore_gens_random:
+            # --- Purely Random Exploration Phase ---
+            action = random.randrange(self.action_size)
+            # Optional: Print during this phase
+            # if self.current_generation < 1 and self.current_genome_idx < 2: # Example print condition
+            #     print(f"  NEAT G{self.current_generation} I{self.current_genome_idx} (Random Action): {action}")
+        elif self.current_generation < self.explore_gens_stochastic:
+            # --- Stochastic (Softmax) Exploration Phase ---
+            processed_obs_np = preprocess_observation(raw_observation, new_size=(self.processed_h, self.processed_w))
+            flat_input = processed_obs_np.flatten()
+            network_outputs = np.array(current_genome.feed_forward(flat_input), dtype=np.float64)
+            
+            stable_logits = network_outputs - np.max(network_outputs)
+            exp_logits = np.exp(stable_logits / self.action_explore_temp)
+            sum_exp_logits = np.sum(exp_logits)
+
+            if sum_exp_logits == 0 or np.isnan(sum_exp_logits) or np.isinf(sum_exp_logits):
+                action = random.randrange(self.action_size)
+            else:
+                probs = exp_logits / sum_exp_logits
+                if np.isnan(probs).any() or not np.isclose(np.sum(probs), 1.0):
+                    action = random.randrange(self.action_size)
+                else:
+                    try:
+                        action = np.random.choice(self.action_size, p=probs)
+                    except ValueError:
+                        action = random.randrange(self.action_size)
+        else: 
+            # --- Standard Greedy Action (Exploitation Phase after exploration) ---
+            processed_obs_np = preprocess_observation(raw_observation, new_size=(self.processed_h, self.processed_w))
+            flat_input = processed_obs_np.flatten()
+            network_outputs = np.array(current_genome.feed_forward(flat_input), dtype=np.float64)
+            action = np.argmax(network_outputs)
+            
         return action
 
     def record_fitness(self, score): # Called by train.py after worker evaluates a genome
