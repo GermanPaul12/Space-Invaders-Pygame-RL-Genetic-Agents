@@ -2,3 +2,23 @@
 __pycache__/
 
 #Models
+
+# Virtual Environment
+venv/
+.venv/
+# Jupyter Notebook checkpoints
+.ipynb_checkpoints
+# Python bytecode
+*.pyc
+# Logs
+*.log
+# Coverage reports
+.coverage
+# Test results
+nosetests.xml
+# Pytest cache
+.pytest_cache/
+# PyCharm project files
+.idea/
+# VS Code settings
+.vscode/
