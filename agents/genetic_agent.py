@@ -1,229 +1,428 @@
 # agents/genetic_agent.py
+import os
+import time
+import json
+import random
+import gymnasium as gym
+from gymnasium.wrappers import RecordVideo, RecordEpisodeStatistics
 import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-import random
+from PIL import Image
 from copy import deepcopy
-from .agent import Agent
-from .dqn_agent import preprocess_observation # Reuse preprocessing
 
-class GeneticNetwork(nn.Module):
-    def __init__(self, input_channels, num_actions, h=84, w=84): # h,w are target preprocessed dimensions
-        super(GeneticNetwork, self).__init__()
-        self.conv1 = nn.Conv2d(input_channels, 16, kernel_size=5, stride=2) # Simpler CNN
-        self.conv2 = nn.Conv2d(16, 32, kernel_size=3, stride=2)
-        
-        def conv_output_size(size, kernel_size, stride, padding=0):
-            return (size - kernel_size + 2 * padding) // stride + 1
-        
-        conv_h = conv_output_size(conv_output_size(h, 5, 2), 3, 2)
-        conv_w = conv_output_size(conv_output_size(w, 5, 2), 3, 2)
-        flattened_size = conv_h * conv_w * 32
-        
-        self.fc1 = nn.Linear(flattened_size, 128)
-        self.fc2 = nn.Linear(128, num_actions)
+from .agent import Agent # Your base Agent class
+
+# --- Preprocessing ---
+def preprocess_observation_ga(obs, new_size=(84, 84)):
+    if obs is None:
+        return np.zeros((1, new_size[0], new_size[1]), dtype=np.float32)
+    if isinstance(obs, tuple):
+        obs = obs[0]
+
+    img = Image.fromarray(obs)
+    img = img.convert('L')
+    img = img.resize(new_size, Image.Resampling.LANCZOS)
+    img_array = np.array(img, dtype=np.float32) / 255.0
+    return np.expand_dims(img_array, axis=0)
+
+# --- Individual Neural Network ---
+class IndividualNetwork(nn.Module):
+    def __init__(self, input_shape, num_actions):
+        super(IndividualNetwork, self).__init__()
+        self.channels, self.height, self.width = input_shape
+
+        self.conv1 = nn.Conv2d(self.channels, 16, kernel_size=8, stride=4)
+        self.conv2 = nn.Conv2d(16, 32, kernel_size=4, stride=2)
+
+        def conv_output_size(size, kernel_size, stride):
+            return (size - (kernel_size - 1) - 1) // stride + 1
+        convw = conv_output_size(conv_output_size(self.width, 8, 4), 4, 2)
+        convh = conv_output_size(conv_output_size(self.height, 8, 4), 4, 2)
+        linear_input_size = convw * convh * 32
+
+        self.fc1 = nn.Linear(linear_input_size, 256)
+        self.fc2 = nn.Linear(256, num_actions)
+        self._initialize_weights()
+
+    def _initialize_weights(self):
+        for m in self.modules():
+            if isinstance(m, nn.Conv2d) or isinstance(m, nn.Linear):
+                nn.init.xavier_uniform_(m.weight)
+                if m.bias is not None:
+                    nn.init.constant_(m.bias, 0)
 
     def forward(self, x):
         x = F.relu(self.conv1(x))
         x = F.relu(self.conv2(x))
         x = x.view(x.size(0), -1)
         x = F.relu(self.fc1(x))
-        return self.fc2(x)
+        x = self.fc2(x)
+        return x
+
+    def get_weights_biases(self):
+        params = []
+        for param in self.parameters():
+            params.append(param.data.cpu().numpy().flatten())
+        return np.concatenate(params)
+
+    def set_weights_biases(self, flat_params):
+        offset = 0
+        for param in self.parameters():
+            param_shape = param.data.shape
+            param_size = np.prod(param_shape)
+            # Ensure flat_params has enough elements
+            if offset + param_size > len(flat_params):
+                print(f"Error: Not enough elements in flat_params to set weights for layer. Needed {param_size}, got {len(flat_params) - offset}")
+                # This indicates a mismatch in network structure or saved weights
+                # You might want to raise an error or handle this more gracefully
+                return # Stop setting weights to prevent further errors
+            param_values = flat_params[offset : offset + param_size].reshape(param_shape)
+            param.data = torch.from_numpy(param_values).to(param.data.device)
+            offset += param_size
+
 
 class GeneticAgent(Agent):
-    def __init__(self, action_size, observation_shape, # (C,H,W) e.g. (1,84,84)
-                 population_size=50, mutation_rate=0.05, mutation_strength=0.1,
-                 crossover_rate=0.7, num_elites=5):
-        super().__init__(action_size, observation_shape)
-        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        print(f"Genetic Agent using device: {self.device}")
+    _default_ga_hparams = {
+        "population_size": 30, # Reduced for faster example runs
+        "mutation_rate": 0.15,
+        "mutation_strength": 0.05,
+        "crossover_rate": 0.7,
+        "num_elites": 3,      # Adjusted
+        "tournament_size": 5,
+        "max_generations": 50, # Default if `episodes` in train is used as generations
+        "max_steps_per_eval": 1500 # Default steps for evaluating one individual
+    }
+    DEFAULT_ENV_ID = "ALE/SpaceInvaders-v5"
 
-        self.input_channels = observation_shape[0]
-        self.processed_h = observation_shape[1]
-        self.processed_w = observation_shape[2]
+    def __init__(self, env_id, hparams, mode, models_dir_for_agent, gifs_dir_for_agent):
+        super().__init__(env_id if env_id else self.DEFAULT_ENV_ID,
+                         hparams, mode, models_dir_for_agent, gifs_dir_for_agent)
 
-        self.population_size = population_size
-        self.mutation_rate = mutation_rate
-        self.mutation_strength = mutation_strength
-        self.crossover_rate = crossover_rate
-        self.num_elites = num_elites
+        self.merged_hparams = self._default_ga_hparams.copy()
+        self.merged_hparams.update(self.hparams)
 
-        self.population = [
-            GeneticNetwork(self.input_channels, action_size, h=self.processed_h, w=self.processed_w).to(self.device)
-            for _ in range(population_size)
-        ]
-        self.fitness_scores = np.zeros(population_size)
-        self.current_individual_idx = 0
-        self.best_fitness_overall = -float('inf') # Track best fitness across generations
-        self.best_individual_overall_state_dict = None # Store state_dict of the best individual overall
+        temp_env = gym.make(self.env_id)
+        self.action_size = temp_env.action_space.n
+        self.preprocessed_obs_shape = (1, 84, 84)
+        temp_env.close()
 
-    def get_current_individual(self):
-        return self.population[self.current_individual_idx]
+        print(f"  Genetic Agent: Env '{self.env_id}', Action Size: {self.action_size}, Obs Shape: {self.preprocessed_obs_shape}")
 
-    def choose_action(self, raw_observation):
-        individual = self.get_current_individual()
-        individual.eval()
+        self.population = self._initialize_population()
+        self.current_generation = 0
+        self.best_fitness_overall = -float('inf')
+        self.best_individual_overall_weights = None
 
-        state_p_np = preprocess_observation(raw_observation, new_size=(self.processed_h, self.processed_w))
-        state_tensor = torch.from_numpy(state_p_np).float().unsqueeze(0).to(self.device)
+        self.active_model = IndividualNetwork(self.preprocessed_obs_shape, self.action_size)
+        if self.population: # Initialize active_model with first individual's weights
+             self.active_model.set_weights_biases(deepcopy(self.population[0].get_weights_biases()))
+
+        self.model_save_path = self.get_next_version_save_path("genetic") # Default save path
+
+
+    def get_model_file_extension(self):
+        return ".pth"
+
+    def _initialize_population(self):
+        population = []
+        pop_size = self.merged_hparams['population_size']
+        print(f"  Initializing population of {pop_size} individuals...")
+        for _ in range(pop_size):
+            individual = IndividualNetwork(self.preprocessed_obs_shape, self.action_size)
+            population.append(individual)
+        return population
+
+    def _evaluate_individual(self, individual_network, eval_env, max_steps):
+        individual_network.eval()
+        obs, info = eval_env.reset()
+        current_obs_p = preprocess_observation_ga(obs)
+        total_reward = 0
+        for _ in range(max_steps):
+            with torch.no_grad():
+                state_tensor = torch.from_numpy(current_obs_p).float().unsqueeze(0)
+                action_logits = individual_network(state_tensor)
+                action = torch.argmax(action_logits, dim=1).item()
+            next_obs_raw, reward, terminated, truncated, info = eval_env.step(action)
+            total_reward += reward
+            current_obs_p = preprocess_observation_ga(next_obs_raw)
+            if terminated or truncated: break
+        return total_reward
+
+    def _select_parents_tournament(self, pop_with_fitness):
+        parents = []
+        for _ in range(2):
+            tournament_contenders = random.sample(pop_with_fitness, self.merged_hparams['tournament_size'])
+            winner = sorted(tournament_contenders, key=lambda x: x[1], reverse=True)[0]
+            parents.append(winner[0])
+        return parents[0], parents[1]
+
+    def _crossover(self, parent1_net, parent2_net):
+        child_net = IndividualNetwork(self.preprocessed_obs_shape, self.action_size)
+        p1_weights = parent1_net.get_weights_biases()
+        p2_weights = parent2_net.get_weights_biases()
+        new_weights = (p1_weights + p2_weights) / 2.0
+        child_net.set_weights_biases(new_weights)
+        return child_net
+
+    def _mutate(self, individual_net):
+        weights = individual_net.get_weights_biases()
+        mutated_weights = weights.copy()
+        for i in range(len(weights)):
+            if random.random() < self.merged_hparams['mutation_rate']:
+                mutation = np.random.normal(0, self.merged_hparams['mutation_strength'])
+                mutated_weights[i] += mutation
+        individual_net.set_weights_biases(mutated_weights)
+        return individual_net
+
+    def train(self, episodes, max_steps_per_episode, render_mode_str,
+              path_to_load_model, force_new_training_if_model_exists,
+              save_interval_eps, print_interval_steps, **kwargs): # print_interval_steps is for gens here
         
+        num_generations = episodes if episodes > 0 else self.merged_hparams['max_generations']
+        steps_for_eval = max_steps_per_episode if max_steps_per_episode > 0 else self.merged_hparams['max_steps_per_eval']
+
+        print(f"\n--- Genetic Algorithm Training Started ---")
+        # ... (parameter printing as before)
+
+        if path_to_load_model and os.path.exists(path_to_load_model) and not force_new_training_if_model_exists:
+            print(f"  Loading GA state from: {path_to_load_model}")
+            self.load(path_to_load_model)
+            self.model_save_path = path_to_load_model # Continue saving to this path
+        else:
+            if force_new_training_if_model_exists and path_to_load_model and os.path.exists(path_to_load_model):
+                print(f"  Force new training: existing model at {path_to_load_model} will be ignored for loading population.")
+            elif path_to_load_model: print(f"  Load path '{path_to_load_model}' not found. Starting fresh.")
+            # Determine a new save path if not loading or forcing new
+            self.model_save_path = self.get_next_version_save_path("genetic")
+        
+        print(f"  Models will be saved to: {os.path.basename(self.model_save_path)}")
+
+        eval_env = gym.make(self.env_id, render_mode=render_mode_str if render_mode_str=="human" else "rgb_array", full_action_space=False)
+        eval_env = RecordEpisodeStatistics(eval_env)
+
+        start_generation = self.current_generation
+        for gen in range(start_generation, num_generations):
+            self.current_generation = gen
+            gen_time_start = time.time()
+            print(f"\n--- Generation {gen + 1}/{num_generations} ---")
+
+            population_with_fitness = []
+            current_gen_fitness_scores = []
+            print(f"  Evaluating {len(self.population)} individuals...")
+            for i, individual_net in enumerate(self.population):
+                fitness = self._evaluate_individual(individual_net, eval_env, steps_for_eval)
+                population_with_fitness.append((individual_net, fitness))
+                current_gen_fitness_scores.append(fitness)
+            
+            sorted_population_tuples = sorted(population_with_fitness, key=lambda x: x[1], reverse=True)
+            
+            best_fitness_this_gen = sorted_population_tuples[0][1] if sorted_population_tuples else -float('inf')
+            avg_fitness_this_gen = np.mean(current_gen_fitness_scores) if current_gen_fitness_scores else -float('inf')
+            
+            print(f"  Generation {gen + 1} Results: Best Fitness: {best_fitness_this_gen:.2f}, Avg Fitness: {avg_fitness_this_gen:.2f}")
+
+            if best_fitness_this_gen > self.best_fitness_overall:
+                self.best_fitness_overall = best_fitness_this_gen
+                # Save weights of the best individual network
+                self.best_individual_overall_weights = deepcopy(sorted_population_tuples[0][0].get_weights_biases())
+                print(f"  New Overall Best Fitness! {self.best_fitness_overall:.2f}")
+
+            new_population = []
+            num_elites = self.merged_hparams['num_elites']
+            elites = [item[0] for item in sorted_population_tuples[:num_elites]] # Get the networks
+            new_population.extend(deepcopy(elites)) # Store copies
+
+            num_offspring_needed = self.merged_hparams['population_size'] - len(new_population)
+            for _ in range(num_offspring_needed):
+                parent1_net, parent2_net = self._select_parents_tournament(population_with_fitness)
+                child_net = self._crossover(parent1_net, parent2_net) if random.random() < self.merged_hparams['crossover_rate'] else deepcopy(parent1_net)
+                child_net = self._mutate(child_net)
+                new_population.append(child_net)
+            
+            self.population = new_population
+            gen_time_end = time.time()
+            print(f"  Generation {gen+1} took {gen_time_end - gen_time_start:.2f} seconds.")
+
+            if save_interval_eps > 0 and (gen + 1) % save_interval_eps == 0:
+                print(f"  Saving model at generation {gen+1}...")
+                self.save(self.model_save_path) # Overwrites the current file
+        
+        eval_env.close()
+        print(f"\n--- Genetic Algorithm Training Finished ---")
+        print(f"Overall Best Fitness Achieved: {self.best_fitness_overall:.2f}")
+        self.save(self.model_save_path)
+
+
+    def choose_action(self, observation_preprocessed, deterministic=True): # Deterministic is implicit for GA eval
+        self.active_model.eval() # Ensure it's in eval mode
         with torch.no_grad():
-            q_values = individual(state_tensor)
-        action = q_values.max(1)[1].item()
+            state_tensor = torch.from_numpy(observation_preprocessed).float().unsqueeze(0)
+            action_logits = self.active_model(state_tensor)
+            action = torch.argmax(action_logits, dim=1).item()
         return action
 
-    def record_fitness(self, score):
-        self.fitness_scores[self.current_individual_idx] = score
-        if score > self.best_fitness_overall:
-            self.best_fitness_overall = score
-        self.current_individual_idx += 1
+    def test(self, model_path_to_load, episodes, max_steps_per_episode,
+             render_during_test, record_video_flag, video_fps, **kwargs):
+        print(f"\n--- Genetic Algorithm Testing ---")
+        # Load best model for testing
+        if model_path_to_load and os.path.exists(model_path_to_load):
+            print(f"  Loading GA state from: {model_path_to_load} for testing.")
+            self.load(model_path_to_load) # This sets self.best_individual_overall_weights
+            if self.best_individual_overall_weights is not None:
+                self.active_model.set_weights_biases(self.best_individual_overall_weights)
+            else:
+                print("  Warning: Loaded file, but no 'best_individual_overall_weights' found. Testing with a potentially random/untrained model.")
+        elif model_path_to_load:
+            print(f"  Warning: Test model path '{model_path_to_load}' not found.")
+            if self.best_individual_overall_weights is None and self.population: # Fallback to first in pop if no best overall and no load
+                 self.active_model.set_weights_biases(self.population[0].get_weights_biases())
+        else: # No model specified, use current best if available
+            print("  No model path for testing. Using current best in memory if available.")
+            if self.best_individual_overall_weights is not None:
+                self.active_model.set_weights_biases(self.best_individual_overall_weights)
+            elif self.population:
+                self.active_model.set_weights_biases(self.population[0].get_weights_biases())
 
-    def learn(self):
-        if not np.any(self.fitness_scores) and self.current_individual_idx < self.population_size : # Check if any scores are actually set
-             print(f"GA: Waiting for all individuals to be evaluated. {self.current_individual_idx}/{self.population_size} done based on internal counter.")
-             # This condition might not be hit if train.py manages current_individual_idx to pop_size before calling learn
-             return
 
-        # --- UPDATE BEST OVERALL FITNESS BASED ON CURRENT GENERATION ---
-        current_gen_max_fitness = np.max(self.fitness_scores)
-        if current_gen_max_fitness > self.best_fitness_overall:
-            self.best_fitness_overall = current_gen_max_fitness
-            best_idx_this_gen = np.argmax(self.fitness_scores)
-            # Store the state_dict of the best individual overall for saving
-            self.best_individual_overall_state_dict = deepcopy(self.population[best_idx_this_gen].state_dict())
-        # --- END UPDATE ---
+        test_env_render_mode = "human" if render_during_test else "rgb_array"
+        test_env = gym.make(self.env_id, render_mode=test_env_render_mode, full_action_space=False)
+        if record_video_flag:
+            ts = time.strftime("%Y%m%d_%H%M%S")
+            video_folder = os.path.join(self.gifs_dir if self.gifs_dir else "videos", f"genetic_test_{ts}")
+            test_env = RecordVideo(test_env, video_folder=video_folder, name_prefix=f"ga_test",
+                                   episode_trigger=lambda ep_id: True, fps=video_fps)
+        test_env = RecordEpisodeStatistics(test_env)
 
-        print(f"GA Generation finished. Max fitness in gen: {current_gen_max_fitness:.2f}, Avg fitness: {np.mean(self.fitness_scores):.2f}, Best overall: {self.best_fitness_overall:.2f}")
-        new_population = []
-        # Elitism
-        elite_indices = np.argsort(self.fitness_scores)[-self.num_elites:]
-        for idx in elite_indices:
-            elite_model = GeneticNetwork(self.input_channels, self.action_size, h=self.processed_h, w=self.processed_w).to(self.device)
-            elite_model.load_state_dict(self.population[idx].state_dict())
-            new_population.append(elite_model)
-
-        # Crossover and Mutation
-        num_offspring = self.population_size - self.num_elites
-        for _ in range(num_offspring // 2): # Create two children per pair of parents
-            if len(new_population) >= self.population_size: break
-            parent1 = self._tournament_selection()
-            parent2 = self._tournament_selection()
-
-            child1_params, child2_params = parent1.state_dict(), parent2.state_dict() # Default to no crossover
-            if random.random() < self.crossover_rate:
-                child1_params, child2_params = self._crossover(parent1.state_dict(), parent2.state_dict())
-
-            child1 = GeneticNetwork(self.input_channels, self.action_size, h=self.processed_h, w=self.processed_w).to(self.device)
-            child1.load_state_dict(self._mutate(child1_params))
-            new_population.append(child1)
-
-            if len(new_population) < self.population_size:
-                child2 = GeneticNetwork(self.input_channels, self.action_size, h=self.processed_h, w=self.processed_w).to(self.device)
-                child2.load_state_dict(self._mutate(child2_params))
-                new_population.append(child2)
+        all_rewards = []
+        for i in range(episodes):
+            obs, info = test_env.reset()
+            current_obs_p = preprocess_observation_ga(obs)
+            episode_reward, current_steps = 0, 0
+            for _ in range(max_steps_per_episode):
+                action = self.choose_action(current_obs_p, deterministic=True)
+                next_obs_raw, reward, terminated, truncated, info = test_env.step(action)
+                episode_reward += reward
+                current_obs_p = preprocess_observation_ga(next_obs_raw)
+                current_steps +=1
+                if render_during_test and test_env_render_mode=="human" and not record_video_flag: test_env.render()
+                if terminated or truncated: break
+            actual_ep_reward = info.get('episode', {}).get('r', episode_reward)
+            all_rewards.append(actual_ep_reward)
+            print(f"  GA Test Episode {i+1}/{episodes} - Score: {actual_ep_reward:.0f}, Steps: {current_steps}")
         
-        # Fill remaining spots if population_size is odd or offspring count wasn't exact
-        while len(new_population) < self.population_size:
-            parent = self._tournament_selection() # Select one parent
-            child = GeneticNetwork(self.input_channels, self.action_size, h=self.processed_h, w=self.processed_w).to(self.device)
-            # Mutate a clone of the parent's parameters
-            child.load_state_dict(self._mutate(deepcopy(parent.state_dict())))
-            new_population.append(child)
+        test_env.close()
+        avg_r = np.mean(all_rewards) if all_rewards else 0
+        std_r = np.std(all_rewards) if all_rewards else 0
+        print(f"\n  GA Test Summary: Avg Score: {avg_r:.2f} +/- {std_r:.2f}")
+        print(f"--- Genetic Algorithm Testing Ended ---")
 
-        self.population = new_population
-        self.fitness_scores = np.zeros(self.population_size) # Reset for next generation
-        self.current_individual_idx = 0 # Reset for next generation's evaluations
-        print("GA: New generation created.")
-
-
-    def _tournament_selection(self, tournament_size=5):
-        selected_indices = random.sample(range(self.population_size), tournament_size)
-        best_idx_in_tournament = selected_indices[0] # Initialize with first
-        best_fitness = -float('inf')
-        for idx in selected_indices:
-            if self.fitness_scores[idx] > best_fitness:
-                best_fitness = self.fitness_scores[idx]
-                best_idx_in_tournament = idx
-        return self.population[best_idx_in_tournament]
-
-    def _crossover(self, params1, params2):
-        child1_params = {}
-        child2_params = {}
-        for name in params1.keys():
-            p1 = params1[name]
-            p2 = params2[name]
-            if p1.ndim > 0 and p1.numel() > 1: # Crossover for non-scalar tensors with more than 1 element
-                split_point = random.randint(1, p1.numel() - 1) # Ensure split_point is not 0 or numel
-                
-                p1_flat = p1.flatten()
-                p2_flat = p2.flatten()
-
-                c1_flat = torch.cat((p1_flat[:split_point], p2_flat[split_point:]))
-                c2_flat = torch.cat((p2_flat[:split_point], p1_flat[split_point:]))
-                
-                child1_params[name] = c1_flat.view_as(p1)
-                child2_params[name] = c2_flat.view_as(p2)
+    def evaluate(self, model_path_to_load, episodes, max_steps_per_episode, **kwargs):
+        print(f"\n--- Genetic Algorithm Evaluation ---")
+        if model_path_to_load and os.path.exists(model_path_to_load):
+            self.load(model_path_to_load)
+            if self.best_individual_overall_weights is not None:
+                self.active_model.set_weights_biases(self.best_individual_overall_weights)
             else:
-                child1_params[name] = p1.clone()
-                child2_params[name] = p2.clone()
-        return child1_params, child2_params
+                print("  Warning: Loaded file for eval, but no 'best_individual_overall_weights'. Using first in population if exists.")
+                if self.population: self.active_model.set_weights_biases(self.population[0].get_weights_biases())
+        elif model_path_to_load:
+             print(f"  Warning: Eval model path '{model_path_to_load}' not found. Using current best if any.")
+             if self.best_individual_overall_weights is not None:
+                self.active_model.set_weights_biases(self.best_individual_overall_weights)
+             elif self.population: self.active_model.set_weights_biases(self.population[0].get_weights_biases())
+        else: # No model path, evaluate current best
+            print("  No model path for eval. Using current best in memory if available.")
+            if self.best_individual_overall_weights is not None:
+                self.active_model.set_weights_biases(self.best_individual_overall_weights)
+            elif self.population: self.active_model.set_weights_biases(self.population[0].get_weights_biases())
 
-    def _mutate(self, params):
-        mutated_params = {}
-        for name, param_tensor in params.items():
-            if param_tensor.ndim > 0:
-                mutation_mask = (torch.rand_like(param_tensor) < self.mutation_rate).float().to(self.device)
-                mutation = torch.randn_like(param_tensor).to(self.device) * self.mutation_strength
-                mutated_params[name] = param_tensor + mutation_mask * mutation
-            else:
-                mutated_params[name] = param_tensor.clone()
-        return mutated_params
-    
+
+        eval_env = gym.make(self.env_id, render_mode="rgb_array", full_action_space=False)
+        eval_env = RecordEpisodeStatistics(eval_env)
+        all_ep_rewards, all_ep_steps = [], []
+        for i in range(episodes):
+            obs, info = eval_env.reset()
+            current_obs_p = preprocess_observation_ga(obs)
+            ep_r, ep_s = 0, 0
+            for _ in range(max_steps_per_episode):
+                action = self.choose_action(current_obs_p, deterministic=True)
+                next_obs_raw, reward, terminated, truncated, info = eval_env.step(action)
+                ep_r += reward; ep_s += 1
+                current_obs_p = preprocess_observation_ga(next_obs_raw)
+                if terminated or truncated: break
+            actual_ep_reward = info.get('episode', {}).get('r', ep_r)
+            actual_ep_steps = info.get('episode', {}).get('l', ep_s)
+            all_ep_rewards.append(actual_ep_reward)
+            all_ep_steps.append(actual_ep_steps)
+            if (i + 1) % max(1, episodes // 5) == 0:
+                 print(f"    GA Eval Ep {i+1}/{episodes}: Score={actual_ep_reward:.0f}, Steps={actual_ep_steps}")
+        eval_env.close()
+
+        results = {}
+        if all_ep_rewards:
+            results = {
+                "num_episodes_eval": episodes,
+                "avg_score": round(np.mean(all_ep_rewards), 2),
+                "std_dev_score": round(np.std(all_ep_rewards), 2),
+                "min_score": round(np.min(all_ep_rewards), 2),
+                "max_score": round(np.max(all_ep_rewards), 2),
+                "avg_steps": round(np.mean(all_ep_steps), 1)
+            }
+        print(f"--- Genetic Algorithm Evaluation Ended ---")
+        return results
+
     def save(self, path):
-        # Save the best individual encountered so far across all generations
-        if self.best_individual_overall_state_dict is not None:
-            torch.save(self.best_individual_overall_state_dict, path)
-            print(f"Best GA individual overall (fitness: {self.best_fitness_overall:.2f}) saved to {path}")
-        elif self.population: # Fallback: if no overall best tracked, save best of current or first
-            # This part may not be hit if best_individual_overall_state_dict is always maintained
-            current_gen_best_idx = 0
-            if np.any(self.fitness_scores): # If current gen has scores
-                current_gen_best_idx = np.argmax(self.fitness_scores)
-            best_individual_to_save = self.population[current_gen_best_idx]
-            torch.save(best_individual_to_save.state_dict(), path)
-            fitness_to_print = self.fitness_scores[current_gen_best_idx] if np.any(self.fitness_scores) else "N/A"
-            print(f"GA: Saved current best/first individual (fitness: {fitness_to_print}) to {path}")
-        else:
-            print("GA: No individuals to save.")
-
+        if path is None:
+            print("  GA Save Error: No path provided.")
+            return
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        population_weights = [ind.get_weights_biases() for ind in self.population]
+        state = {
+            'population_weights': population_weights,
+            'best_individual_overall_weights': self.best_individual_overall_weights,
+            'best_fitness_overall': self.best_fitness_overall,
+            'current_generation': self.current_generation,
+            'hparams': self.merged_hparams # Save hyperparameters used for this run
+        }
+        try:
+            torch.save(state, path)
+            print(f"  Genetic Agent state saved to {os.path.basename(path)}")
+        except Exception as e:
+            print(f"  Error saving Genetic Agent state to {path}: {e}")
 
     def load(self, path):
-        # When loading, we are essentially starting a new evolutionary run seeded by this individual.
-        # The loaded individual's fitness isn't directly transferred to best_fitness_overall yet.
-        # best_fitness_overall will be updated as this new population is evaluated.
+        if not os.path.exists(path):
+            print(f"  GA Load Error: Path does not exist: {path}")
+            return
         try:
-            loaded_state_dict = torch.load(path, map_location=self.device)
+            state = torch.load(path)
+            loaded_hparams = state.get('hparams', self.merged_hparams) # Load hparams if saved
+            
+            # Re-initialize population with correct size from loaded hparams or current
+            self.merged_hparams['population_size'] = loaded_hparams.get('population_size', self.merged_hparams['population_size'])
             self.population = []
-            for _ in range(self.population_size):
-                individual = GeneticNetwork(self.input_channels, self.action_size, h=self.processed_h, w=self.processed_w).to(self.device)
-                individual.load_state_dict(loaded_state_dict)
+            for weights_array in state['population_weights']:
+                individual = IndividualNetwork(self.preprocessed_obs_shape, self.action_size)
+                individual.set_weights_biases(weights_array)
                 self.population.append(individual)
             
-            self.current_individual_idx = 0
-            self.fitness_scores = np.zeros(self.population_size)
-            # Reset best_fitness_overall; it will be re-established by the new evaluations.
-            self.best_fitness_overall = -float('inf') 
-            self.best_individual_overall_state_dict = None # Also reset this
-            print(f"GA population initialized with model from {path}. Best overall fitness will be re-evaluated.")
+            self.best_individual_overall_weights = state.get('best_individual_overall_weights')
+            self.best_fitness_overall = state.get('best_fitness_overall', -float('inf'))
+            self.current_generation = state.get('current_generation', 0)
+            
+            # If best weights are loaded, set active_model
+            if self.best_individual_overall_weights is not None:
+                self.active_model.set_weights_biases(self.best_individual_overall_weights)
+            elif self.population: # Fallback to first in loaded population
+                self.active_model.set_weights_biases(self.population[0].get_weights_biases())
+
+            print(f"  Genetic Agent state loaded from {os.path.basename(path)}. Resuming from generation {self.current_generation + 1}.")
         except Exception as e:
-            print(f"Error loading GA model from {path}: {e}. Initializing new random population.")
-            # Re-initialize population if load fails
-            self.population = [
-                GeneticNetwork(self.input_channels, self.action_size, h=self.processed_h, w=self.processed_w).to(self.device)
-                for _ in range(self.population_size)
-            ]
-            self.current_individual_idx = 0
-            self.fitness_scores = np.zeros(self.population_size)
+            print(f"  Error loading Genetic Agent state from {path}: {e}")
+            # Fallback to re-initializing if load fails badly
+            self.population = self._initialize_population()
+            self.current_generation = 0
             self.best_fitness_overall = -float('inf')
-            self.best_individual_overall_state_dict = None
+            self.best_individual_overall_weights = None

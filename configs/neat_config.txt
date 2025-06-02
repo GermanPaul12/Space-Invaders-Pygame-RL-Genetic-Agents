@@ -1,0 +1,68 @@
+[NEAT]
+fitness_criterion     = max
+fitness_threshold     = 50000  
+# Target fitness for Space Invaders (can be high)
+pop_size              = 30     
+# Smaller population for quicker example runs
+reset_on_extinction   = True
+
+[DefaultGenome]
+# node activation options
+activation_default      = relu
+activation_mutate_rate  = 0.1
+activation_options      = relu clamped tanh sigmoid gauss
+
+# node aggregation options
+aggregation_default     = sum
+aggregation_mutate_rate = 0.0
+aggregation_options     = sum
+
+# node bias options
+bias_init_mean          = 0.0
+bias_init_stdev         = 1.0
+bias_max_value          = 10.0
+bias_min_value          = -10.0
+bias_mutate_power       = 0.5
+bias_mutate_rate        = 0.7
+bias_replace_rate       = 0.1
+
+# genome compatibility options
+compatibility_disjoint_coefficient = 1.0
+compatibility_weight_coefficient   = 0.6 # Adjusted
+
+# connection add/remove rates
+conn_add_prob           = 0.2  # Lowered slightly
+conn_delete_prob        = 0.1
+
+# connection enable options
+enabled_default         = True
+enabled_mutate_rate     = 0.01 # Lowered
+
+feed_forward            = True
+initial_connection      = full_nodirect # 'full_nodirect' or 'fs_neat_legacy' can be good starting points
+
+# node add/remove rates
+node_add_prob           = 0.1 # Lowered slightly
+node_delete_prob        = 0.05
+
+# network parameters
+num_hidden              = 0    # NEAT adds hidden nodes
+num_inputs              = 7056 # 84 * 84 for flattened preprocessed frame
+num_outputs             = 6    # For SpaceInvaders-v5 with full_action_space=False
+
+# weight options
+weight_init_mean        = 0.0
+weight_init_stdev       = 1.0
+weight_max_value        = 10.0
+weight_min_value        = -10.0
+weight_mutate_power     = 0.5
+weight_mutate_rate      = 0.8
+weight_replace_rate     = 0.1
+
+[DefaultSpeciesSet]
+compatibility_threshold = 4.0  Adjusted
+
+[DefaultStagnation]
+species_fitness_func = max
+max_stagnation       = 20
+species_elitism      = 2

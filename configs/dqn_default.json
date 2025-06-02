@@ -1,10 +1,9 @@
 {
+    "learning_rate": 0.00025,
     "buffer_size": 50000,
-    "batch_size": 32,
-    "gamma": 0.99,
-    "lr": 0.0001,
-    "target_update_freq": 1000,
-    "eps_start": 1.0,
-    "eps_end": 0.01,
-    "eps_decay": 100000
+    "learning_starts": 5000,
+    "target_update_interval": 2000,
+    "exploration_fraction": 0.2,
+    "verbose": 0,
+    "tensorboard_log": true
 }

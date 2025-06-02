@@ -1,8 +1,9 @@
 {
-    "lr": 0.0007,
-    "gamma": 0.99,
-    "entropy_coef": 0.01,
-    "value_loss_coef": 0.5,
-    "mini_batch_size": 64,
-    "a2c_epochs": 4
+    "learning_rate": 0.0005,
+    "n_steps": 5,
+    "n_envs": 8, 
+    "ent_coef": 0.01,
+    "vf_coef": 0.25,
+    "tensorboard_log": true,
+    "verbose": 0 
 }

@@ -1,324 +1,355 @@
 # agents/ppo_agent.py
-import random
+import os
+import time
+import json
+import gymnasium as gym
+from gymnasium.wrappers import RecordVideo # RecordEpisodeStatistics is typically handled by Monitor
 import numpy as np
-import torch
-import torch.nn as nn
-import torch.optim as optim
-import torch.nn.functional as F
-from torch.distributions import Categorical
-from .agent import Agent
-from .dqn_agent import preprocess_observation # Reuse preprocessing
+import torch # SB3 uses PyTorch
 
-# --- Constants for PPO ---
-# Consider moving to config or keeping here if PPO specific
-REWARD_SCALING_FACTOR = 100.0  # Example: Tune this based on your reward magnitudes
+try:
+    from stable_baselines3 import PPO as SB3_PPO
+    from stable_baselines3.common.env_util import make_atari_env
+    from stable_baselines3.common.vec_env import VecFrameStack
+    from stable_baselines3.common.monitor import Monitor # For single env episode stats
+    from stable_baselines3.common.atari_wrappers import AtariWrapper # For single env recording/testing
+    from stable_baselines3.common.callbacks import BaseCallback # For custom logging if needed
+    from stable_baselines3.common.evaluation import evaluate_policy
+    SB3_AVAILABLE = True
+except ImportError:
+    SB3_AVAILABLE = False
+    print("Warning: stable-baselines3 or its dependencies not found. PPOAgent will not be available.")
+    # Dummy classes for type hinting if SB3 is not available
+    class SB3_PPO: pass
+    class VecFrameStack: pass
+    class BaseCallback: pass
 
-class PPOActorCriticNetwork(nn.Module):
-    def __init__(self, input_channels, num_actions, h=84, w=84):
-        super(PPOActorCriticNetwork, self).__init__()
-        self.conv1 = nn.Conv2d(input_channels, 32, kernel_size=8, stride=4)
-        self.conv2 = nn.Conv2d(32, 64, kernel_size=4, stride=2)
-        self.conv3 = nn.Conv2d(64, 64, kernel_size=3, stride=1)
-
-        def conv_output_size(size, kernel_size, stride):
-            return (size - (kernel_size - 1) - 1) // stride + 1
-        conv_h = conv_output_size(conv_output_size(conv_output_size(h, 8, 4), 4, 2), 3, 1)
-        conv_w = conv_output_size(conv_output_size(conv_output_size(w, 8, 4), 4, 2), 3, 1)
-        flattened_size = conv_h * conv_w * 64
-        
-        self.fc_shared = nn.Linear(flattened_size, 512)
-        self.actor_fc = nn.Linear(512, num_actions) 
-        self.critic_fc = nn.Linear(512, 1)
-
-    def forward(self, x):
-        x = F.relu(self.conv1(x))
-        x = F.relu(self.conv2(x))
-        x = F.relu(self.conv3(x))
-        x = x.view(x.size(0), -1)
-        x_shared = F.relu(self.fc_shared(x))
-        action_logits = self.actor_fc(x_shared) 
-        state_value = self.critic_fc(x_shared)
-        return action_logits, state_value
+from .agent import Agent # Your base Agent class
+from .dqn_agent import PrintCallback # Re-use the PrintCallback for logging consistency
 
 class PPOAgent(Agent):
-    def __init__(self, action_size, observation_shape, 
-                 lr=2.5e-4, gamma=0.99, gae_lambda=0.95,
-                 ppo_clip=0.2, ppo_epochs=4, mini_batch_size=32,
-                 entropy_coef=0.01, value_loss_coef=0.5,
-                 trajectory_n_steps=128):
-        super().__init__(action_size, observation_shape)
-        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        print(f"PPO Agent using device: {self.device}")
+    """
+    A Proximal Policy Optimization (PPO) Agent using Stable Baselines 3.
+    """
+    _default_sb3_ppo_hparams = {
+        "learning_rate": 0.000025, # Often 2.5e-4 or 3e-4 for PPO on Atari
+        "n_steps": 128,         # Number of steps to run for each environment per update (rollout buffer size = n_steps * n_envs)
+        "batch_size": 256,       # Minibatch size for PPO updates (SB3 PPO calculates this based on n_envs and n_steps for full batch, then sub-batches)
+                                # For SB3, batch_size is often n_steps * n_envs / nminibatches. Let's set nminibatches.
+        "n_epochs": 4,          # Number of epochs when optimizing the surrogate loss
+        "gamma": 0.99,
+        "gae_lambda": 0.95,
+        "clip_range": 0.1,      # Clipping parameter, often 0.1 or 0.2
+        "ent_coef": 0.01,       # Entropy coefficient
+        "vf_coef": 0.5,         # Value function coefficient
+        "max_grad_norm": 0.5,
+        "policy_kwargs": None,  # e.g., dict(net_arch=[dict(pi=[64], vf=[64])])
+        "tensorboard_log": None,
+        "verbose": 0,
+        "device": "auto"
+    }
+    # PPO benefits greatly from multiple environments
+    _sb3_env_params = {
+        "n_envs": 8,
+        "seed": None,
+        "wrapper_kwargs": dict(clip_rewards=True, episodic_life=True, fire_on_reset=True),
+        "n_stack": 4,
+    }
+    DEFAULT_ENV_ID = "SpaceInvadersNoFrameskip-v4"
 
-        self.input_channels = observation_shape[0]
-        self.processed_h = observation_shape[1]
-        self.processed_w = observation_shape[2]
+    def __init__(self, env_id, hparams, mode, models_dir_for_agent, gifs_dir_for_agent):
+        if not SB3_AVAILABLE:
+            raise ImportError("Stable Baselines 3 is not available. Please install it to use PPOAgent.")
 
-        self.network = PPOActorCriticNetwork(
-            self.input_channels, action_size, h=self.processed_h, w=self.processed_w
-        ).to(self.device)
-        self.optimizer = optim.Adam(self.network.parameters(), lr=lr, eps=1e-5) # eps for Adam stability
+        super().__init__(env_id if env_id else self.DEFAULT_ENV_ID,
+                         hparams, mode, models_dir_for_agent, gifs_dir_for_agent)
         
-        self.gamma = gamma
-        self.gae_lambda = gae_lambda
-        self.ppo_clip = ppo_clip
-        self.ppo_epochs = ppo_epochs
-        self.mini_batch_size = mini_batch_size
-        self.entropy_coef = entropy_coef
-        self.value_loss_coef = value_loss_coef
-        self.trajectory_n_steps = trajectory_n_steps
+        self.merged_hparams = self._default_sb3_ppo_hparams.copy()
+        self.merged_hparams.update(self.hparams)
 
-        self.buffer = {
-            'states': [], 'actions': [], 'log_probs': [],
-            'rewards': [], 'dones': [], 'values': []
-        }
-        self.current_buffer_size = 0
-        self._temp_action_data = {}
-
-    def _clear_buffer(self):
-        for k in self.buffer: self.buffer[k] = []
-        self.current_buffer_size = 0
-
-    def choose_action(self, raw_observation):
-        state_p_np = preprocess_observation(raw_observation, new_size=(self.processed_h, self.processed_w))
-        state_tensor = torch.from_numpy(state_p_np).float().unsqueeze(0).to(self.device)
+        self.env_creation_params = self._sb3_env_params.copy()
+        if "n_envs" in self.merged_hparams: self.env_creation_params["n_envs"] = self.merged_hparams.pop("n_envs")
+        if "seed" in self.merged_hparams: self.env_creation_params["seed"] = self.merged_hparams.pop("seed")
+        if "n_stack" in self.merged_hparams: self.env_creation_params["n_stack"] = self.merged_hparams.pop("n_stack")
         
-        log_prob_item = -1e8 # Default for safety if action selection fails
-        action_item = 0      # Default action
-
-        with torch.no_grad():
-            self.network.eval() # Set network to eval mode for consistent outputs
-            action_logits, state_value = self.network(state_tensor)
-            if not self.is_evaluating: # If training, set back to train mode
-                 self.network.train()
+        # SB3 PPO's batch_size is typically total rollout buffer size / num_minibatches
+        # We will let SB3 handle it by not explicitly setting batch_size unless user overrides.
+        # If user provides batch_size, we assume it's the minibatch_size SB3 PPO expects.
+        # Default n_steps = 128, n_envs = 8 -> rollout = 1024. With n_epochs=4.
+        # Default batch_size in SB3 PPO is 64. So 1024/64 = 16 minibatches.
+        # If we want to control minibatches, we can calculate batch_size, but it's usually fine.
 
 
-        if torch.isnan(action_logits).any() or torch.isinf(action_logits).any():
-            print(f"PPO CHOOSE_ACTION DEBUG: NaN/Inf in action_logits: {action_logits}")
-            action_item = random.randrange(self.action_size) # Fallback random action
-            # log_prob remains default small value
-        else:
+        if self.merged_hparams.get("tensorboard_log") is True:
+            self.merged_hparams["tensorboard_log"] = os.path.join(self.models_dir, "tensorboard_logs", "ppo")
+        elif isinstance(self.merged_hparams.get("tensorboard_log"), str):
+            self.merged_hparams["tensorboard_log"] = os.path.join(self.models_dir, self.merged_hparams["tensorboard_log"])
+
+        try:
+            temp_env = make_atari_env(self.env_id, n_envs=1, wrapper_kwargs=self.env_creation_params["wrapper_kwargs"])
+            temp_env = VecFrameStack(temp_env, n_stack=self.env_creation_params["n_stack"])
+            self.action_size = temp_env.action_space.n
+            self.observation_shape = temp_env.observation_space.shape
+            print(f"  PPO Agent: Env '{self.env_id}', Action Size: {self.action_size}, Obs Shape: {self.observation_shape}")
+            temp_env.close()
+            del temp_env
+        except Exception as e:
+            print(f"  PPO Agent: Could not query temp env for spaces: {e}")
+            self.action_size = 6
+            self.observation_shape = (self.env_creation_params["n_stack"], 84, 84)
+
+    def get_model_file_extension(self):
+        return ".zip"
+
+    def _create_env(self, for_training=True, n_envs_override=None):
+        env_seed = self.env_creation_params["seed"]
+        if env_seed is None and for_training: env_seed = int(time.time())
+        elif env_seed is None and not for_training: env_seed = 42
+        
+        n_actual_envs = n_envs_override if n_envs_override is not None else self.env_creation_params["n_envs"]
+        print(f"  Creating SB3 VecEnv for PPO: {self.env_id}, N_Envs={n_actual_envs}, Seed={env_seed}, N_Stack={self.env_creation_params['n_stack']}")
+        vec_env = make_atari_env(
+            self.env_id, n_envs=n_actual_envs, seed=env_seed,
+            wrapper_kwargs=self.env_creation_params["wrapper_kwargs"]
+        )
+        vec_env = VecFrameStack(vec_env, n_stack=self.env_creation_params["n_stack"])
+        return vec_env
+
+    def train(self, episodes, max_steps_per_episode, render_mode_str,
+              path_to_load_model, force_new_training_if_model_exists,
+              save_interval_eps, print_interval_steps, **kwargs):
+        print(f"\n--- PPO Training Started ---")
+        self.train_env = self._create_env(for_training=True)
+
+        self.model_save_path = None # Initialize
+        if path_to_load_model and os.path.exists(path_to_load_model) and not force_new_training_if_model_exists:
+            self.model_save_path = path_to_load_model
+            print(f"  Attempting to load and continue training PPO model: {os.path.basename(self.model_save_path)}")
             try:
-                m = Categorical(logits=action_logits)
-                if self.is_evaluating: # Greedy action for evaluation
-                    action = torch.argmax(action_logits, dim=1)
-                else: # Sample during training
-                    action = m.sample()
-                log_prob = m.log_prob(action) # Calculate log_prob for chosen action
-                log_prob_item = log_prob.item()
-                action_item = action.item()
-            except ValueError as e:
-                print(f"PPO CHOOSE_ACTION CRITICAL: ValueError creating Categorical. Logits: {action_logits}. Error: {e}")
-                action_item = random.randrange(self.action_size) # Fallback
-
-        # Only store data needed for learning if in training mode
-        if not self.is_evaluating:
-            self._temp_action_data = {
-                'state': state_p_np, 
-                'action': action_item,
-                'log_prob': log_prob_item, 
-                'value': state_value.item() 
-            }
-        return action_item
-    
-    # ... (store_transition_outcome, _compute_gae, learn, save, load as before) ...
-    # Make sure _compute_gae and learn methods are robust to potentially empty/small buffers if
-    # store_transition_outcome isn't called as frequently during pure evaluation.
-    # The current learn is called from store_transition_outcome, so it's fine.
-    def store_transition_outcome(self, reward, done, raw_next_observation):
-        if self.is_evaluating: # Don't store or learn during pure evaluation
-            return None
-
-        scaled_reward = reward / REWARD_SCALING_FACTOR
-        self.buffer['states'].append(self._temp_action_data['state'])
-        self.buffer['actions'].append(self._temp_action_data['action'])
-        self.buffer['log_probs'].append(self._temp_action_data['log_prob'])
-        self.buffer['values'].append(self._temp_action_data['value']) 
-        self.buffer['rewards'].append(scaled_reward) 
-        self.buffer['dones'].append(done)
-        self.current_buffer_size += 1
-        loss = None 
-        if self.current_buffer_size >= self.trajectory_n_steps or done:
-            last_value = 0.0 
-            if not done and raw_next_observation is not None:
-                next_state_p_np = preprocess_observation(raw_next_observation, new_size=(self.processed_h, self.processed_w))
-                next_state_tensor = torch.from_numpy(next_state_p_np).float().unsqueeze(0).to(self.device)
-                with torch.no_grad():
-                    self.network.eval() # Ensure eval mode for this prediction
-                    _, last_val_tensor = self.network(next_state_tensor)
-                    self.network.train() # Revert to train mode
-                last_value = last_val_tensor.item()
-            loss = self.learn(last_value) 
-            self._clear_buffer()
-        return loss 
-    def store_transition_outcome(self, reward, done, raw_next_observation):
-        # Scale reward before storing
-        scaled_reward = reward / REWARD_SCALING_FACTOR
-
-        self.buffer['states'].append(self._temp_action_data['state'])
-        self.buffer['actions'].append(self._temp_action_data['action'])
-        self.buffer['log_probs'].append(self._temp_action_data['log_prob'])
-        self.buffer['values'].append(self._temp_action_data['value']) # V(s_t)
-        self.buffer['rewards'].append(scaled_reward) # Store scaled reward
-        self.buffer['dones'].append(done)
-        self.current_buffer_size += 1
-
-        loss = None # Initialize loss
-        if self.current_buffer_size >= self.trajectory_n_steps or done:
-            last_value = 0.0 # V(s_{t+N}) or V(s_terminal)
-            if not done and raw_next_observation is not None:
-                next_state_p_np = preprocess_observation(raw_next_observation, new_size=(self.processed_h, self.processed_w))
-                next_state_tensor = torch.from_numpy(next_state_p_np).float().unsqueeze(0).to(self.device)
-                with torch.no_grad():
-                    _, last_val_tensor = self.network(next_state_tensor) # Get V(s_{t+N})
-                last_value = last_val_tensor.item()
-            
-            loss = self.learn(last_value) # learn() returns the average loss over epochs/minibatches
-            self._clear_buffer()
-        return loss # Return loss (or None if buffer not full and not done)
-
-    def _compute_gae(self, rewards_np, values_np, dones_np, last_value):
-        # --- DEBUG: Check inputs to GAE ---
-        if np.isnan(rewards_np).any() or np.isinf(rewards_np).any(): print(f"PPO GAE DEBUG: NaN/Inf in rewards_np input: {rewards_np}")
-        if np.isnan(values_np).any() or np.isinf(values_np).any(): print(f"PPO GAE DEBUG: NaN/Inf in values_np input: {values_np}")
-        if np.isnan(last_value) or np.isinf(last_value): print(f"PPO GAE DEBUG: NaN/Inf in last_value input: {last_value}")
-        # --- END DEBUG ---
-
-        advantages = np.zeros_like(rewards_np, dtype=np.float32)
-        gae = 0.0
-        
-        # values_np contains V(s_0)...V(s_{N-1}) from the buffer
-        # last_value is the bootstrapped V(s_N) or 0 if s_{N-1} was terminal
-        for t in reversed(range(len(rewards_np))):
-            if dones_np[t]: # If s_t was terminal, delta considers only r_t - V(s_t)
-                delta = rewards_np[t] - values_np[t]
-                gae = delta # GAE starts fresh after a terminal state
-            else:
-                # V(s_{t+1})
-                next_val = values_np[t+1] if t < len(rewards_np) - 1 else last_value
-                delta = rewards_np[t] + self.gamma * next_val - values_np[t]
-                gae = delta + self.gamma * self.gae_lambda * gae # If s_t was terminal, (1-dones[t]) would be 0.
-                                                              # But we handle terminal with 'if dones_np[t]'
-            advantages[t] = gae
-        
-        returns_np = advantages + values_np # Q-values estimates using GAE
-        return advantages, returns_np
-
-    def learn(self, last_value): # last_value is V(s_N)
-        # Convert buffer to tensors
-        states_np = np.stack(self.buffer['states'])
-        states_t = torch.from_numpy(states_np).float().to(self.device)
-        actions_t = torch.tensor(self.buffer['actions'], device=self.device, dtype=torch.long)
-        old_log_probs_t = torch.tensor(self.buffer['log_probs'], device=self.device, dtype=torch.float)
-        
-        rewards_np = np.array(self.buffer['rewards'], dtype=np.float32)
-        dones_np = np.array(self.buffer['dones'], dtype=np.bool_)
-        values_np = np.array(self.buffer['values'], dtype=np.float32) # These are V(s_t) collected at each step
-
-        advantages_np, returns_np = self._compute_gae(rewards_np, values_np, dones_np, last_value)
-        
-        if np.isnan(advantages_np).any() or np.isinf(advantages_np).any(): print(f"PPO LEARN DEBUG: NaN/Inf in advantages_np after GAE: {advantages_np}")
-        if np.isnan(returns_np).any() or np.isinf(returns_np).any(): print(f"PPO LEARN DEBUG: NaN/Inf in returns_np after GAE: {returns_np}")
-        
-        advantages_t = torch.from_numpy(advantages_np).float().to(self.device)
-        returns_t = torch.from_numpy(returns_np).float().to(self.device)
-
-        # Normalize advantages
-        adv_mean = advantages_t.mean()
-        adv_std = advantages_t.std()
-        if torch.isnan(adv_std) or torch.isinf(adv_std) or adv_std < 1e-8:
-            print(f"PPO LEARN DEBUG: Invalid adv_std: {adv_std}. Advantages before norm: {advantages_t}. Mean: {adv_mean}")
-            # If std is very small or NaN, avoid division by it; effectively no normalization or use raw advantages.
-            # This can happen if trajectory_n_steps is 1 and advantages are constant.
-            normalized_advantages_t = advantages_t - adv_mean # Just center if std is bad
+                self.model = SB3_PPO.load(self.model_save_path, env=self.train_env, device=self.merged_hparams["device"])
+                print(f"  PPO Model loaded successfully from {os.path.basename(self.model_save_path)}.")
+            except Exception as e:
+                print(f"  Failed to load PPO model: {e}. Creating a new model.")
+                path_to_load_model = None 
+                self.model_save_path = self.get_next_version_save_path("ppo")
+                self.model = SB3_PPO("CnnPolicy", self.train_env, **self.merged_hparams)
         else:
-            normalized_advantages_t = (advantages_t - adv_mean) / (adv_std + 1e-8)
-        
-        if torch.isnan(normalized_advantages_t).any() or torch.isinf(normalized_advantages_t).any():
-             print(f"PPO LEARN DEBUG: NaN/Inf in normalized_advantages_t: {normalized_advantages_t}")
+            if force_new_training_if_model_exists and path_to_load_model and os.path.exists(path_to_load_model):
+                self.model_save_path = self.get_next_version_save_path("ppo")
+            elif path_to_load_model and not os.path.exists(path_to_load_model):
+                self.model_save_path = self.get_next_version_save_path("ppo")
+            else:
+                self.model_save_path = self.get_model_save_path_for_agent("ppo")
+                if os.path.exists(self.model_save_path) and not force_new_training_if_model_exists:
+                     self.model_save_path = self.get_next_version_save_path("ppo")
+            print(f"  Creating new PPO model. It will be saved to: {os.path.basename(self.model_save_path)}")
+            self.model = SB3_PPO("CnnPolicy", self.train_env, **self.merged_hparams)
 
-        total_loss_accumulator = 0.0
-        num_minibatches = 0
+        # PPO is on-policy. total_timesteps is the main driver.
+        # episodes * max_steps_per_episode gives a rough single-environment equivalent.
+        # For SB3 VecEnv, total experience is roughly episodes * max_steps_per_episode * n_envs,
+        # but SB3 `learn` uses its own `n_steps` per environment to collect rollouts.
+        # We'll calculate total_timesteps based on single-env episodes for user understanding.
+        # The actual number of environment interactions will be higher due to n_envs.
+        # More accurate: training_steps = total_episodes_across_all_envs * average_episode_length
+        # Let's use episodes * max_steps as a guideline for total single-agent experience.
+        total_timesteps_estimate = episodes * max_steps_per_episode
+        # SB3's PPO will run n_steps * n_envs interactions before each update.
+        # Total timesteps for model.learn should be significantly higher if using multiple envs.
+        # Let's adjust the target for learn() based on n_envs
+        adjusted_total_timesteps = total_timesteps_estimate * self.env_creation_params["n_envs"] # This is a very rough guide.
+        # A more standard way is to set a very high number of total_timesteps for `learn` and monitor performance.
+        # Or calculate based on desired number of updates: num_updates * n_steps * n_envs
+        # For simplicity, let's make `episodes` correspond to "epochs" of data collection.
+        # If one "episode" for the user means "roughly max_steps_per_episode on one conceptual env", then
+        # total_timesteps for model.learn could be episodes * max_steps_per_episode.
+        # SB3 will internally distribute this across n_envs.
+        print(f"  Target total timesteps for SB3 PPO learn(): ~{total_timesteps_estimate} (distributed across {self.env_creation_params['n_envs']} envs)")
+
+
+        callbacks = []
+        if print_interval_steps > 0: # This interval is for total steps across all envs
+            callbacks.append(PrintCallback(print_interval_steps=print_interval_steps))
+        if save_interval_eps > 0:
+             print(f"  Note: save_interval_eps ({save_interval_eps}) for SB3 PPO is best handled with a custom CheckpointCallback. Model will save at end.")
+
+        try:
+            self.model.learn(
+                total_timesteps=total_timesteps_estimate, # This means total steps for the entire training process
+                callback=callbacks if callbacks else None,
+                log_interval=1, # PPO usually logs per rollout completion
+                reset_num_timesteps=(path_to_load_model is None)
+            )
+            print(f"  PPO training loop finished.")
+            self.save(self.model_save_path)
+        except KeyboardInterrupt:
+            print("\n  PPO Training interrupted. Saving current model...")
+            self.save(self.model_save_path)
+        except Exception as e:
+            print(f"  An error occurred during PPO training: {e}")
+            import traceback; traceback.print_exc()
+            self.save(self.model_save_path) # Attempt to save
+        finally:
+            if self.train_env: self.train_env.close()
+            print(f"--- PPO Training Ended ---")
+
+
+    def test(self, model_path_to_load, episodes, max_steps_per_episode,
+             render_during_test, record_video_flag, video_fps, **kwargs):
+        print(f"\n--- PPO Testing ---")
+        if not model_path_to_load or not os.path.exists(model_path_to_load):
+            print(f"  Error: Model path '{model_path_to_load}' not found. Cannot test PPO.")
+            if self.mode == 'test' and model_path_to_load is None:
+                print(f"  Attempting to test with a new, untrained PPO model instance.")
+                temp_eval_env = self._create_env(for_training=False, n_envs_override=1)
+                self.model = SB3_PPO("CnnPolicy", temp_eval_env, **self.merged_hparams)
+                temp_eval_env.close()
+                model_path_to_load = "Untrained PPO Model"
+            else:
+                return
+
+        eval_env = gym.make(self.env_id, render_mode="human" if render_during_test else "rgb_array", full_action_space=False)
+        eval_env = AtariWrapper(eval_env, clip_reward=False) # No clip for eval
+        eval_env = gym.wrappers.FrameStack(eval_env, self.env_creation_params["n_stack"])
+        eval_env = Monitor(eval_env)
+
+        if model_path_to_load != "Untrained PPO Model":
+            print(f"  Loading PPO model for testing: {os.path.basename(model_path_to_load)}")
+            # PPO models (like A2C) can often be loaded without an env if using standard policies
+            self.model = SB3_PPO.load(model_path_to_load, env=None, device=self.merged_hparams["device"])
         
-        for epoch_num in range(self.ppo_epochs):
-            # Create minibatches from the full trajectory data
-            num_samples = self.current_buffer_size # Should be len(states_t)
-            indices = np.arange(num_samples)
-            np.random.shuffle(indices)
+        all_rewards = []
+        for i in range(episodes):
+            obs, info = eval_env.reset()
+            terminated, truncated = False, False
+            episode_reward, current_steps = 0, 0
+            while not (terminated or truncated) and current_steps < max_steps_per_episode:
+                action, _ = self.model.predict(obs, deterministic=True)
+                obs, reward, terminated, truncated, info = eval_env.step(action)
+                episode_reward += reward
+                current_steps += 1
+                if render_during_test and eval_env.render_mode == "human": eval_env.render()
+            actual_ep_reward = info.get('episode', {}).get('r', episode_reward)
+            all_rewards.append(actual_ep_reward)
+            print(f"  PPO Test Episode {i+1}/{episodes} - Score: {actual_ep_reward:.0f}, Steps: {current_steps}")
+        eval_env.close()
+
+        avg_reward = np.mean(all_rewards) if all_rewards else 0
+        std_reward = np.std(all_rewards) if all_rewards else 0
+        print(f"\n  PPO Test Summary: Avg Score: {avg_reward:.2f} +/- {std_reward:.2f}")
+
+        if record_video_flag and model_path_to_load != "Untrained PPO Model":
+            print(f"\n  Recording PPO representative run (video)...")
+            video_record_env = gym.make(self.env_id, render_mode="rgb_array", full_action_space=False)
+            video_record_env = AtariWrapper(video_record_env, clip_reward=False)
+            video_record_env = gym.wrappers.FrameStack(video_record_env, self.env_creation_params["n_stack"])
+            ts = time.strftime("%Y%m%d_%H%M%S")
+            video_folder = os.path.join(self.gifs_dir if self.gifs_dir else "videos", f"ppo_test_{ts}")
+            video_env_instance = RecordVideo(
+                video_record_env, video_folder=video_folder,
+                name_prefix=f"ppo_run_{os.path.basename(model_path_to_load).replace(self.get_model_file_extension(),'')}",
+                episode_trigger=lambda ep_id: ep_id == 0, video_length=max_steps_per_episode, fps=video_fps
+            )
+            try:
+                obs, info = video_env_instance.reset()
+                terminated, truncated = False, False; vid_ep_reward = 0; vid_steps = 0
+                while not (terminated or truncated) and vid_steps < max_steps_per_episode:
+                    action, _ = self.model.predict(obs, deterministic=True)
+                    obs, reward, terminated, truncated, info = video_env_instance.step(action)
+                    vid_ep_reward += reward; vid_steps += 1
+                print(f"  PPO Video recorded. Score: {vid_ep_reward:.0f}. Saved in: {video_folder}")
+            except Exception as e_vid: print(f"  Error during PPO video recording: {e_vid}")
+            finally:
+                if video_env_instance: video_env_instance.close()
+        print(f"--- PPO Testing Ended ---")
+
+
+    def evaluate(self, model_path_to_load, episodes, max_steps_per_episode, **kwargs):
+        print(f"\n--- PPO Evaluation ---")
+        if not model_path_to_load or not os.path.exists(model_path_to_load):
+            print(f"  Error: Model path '{model_path_to_load}' not found for PPO. Cannot evaluate.")
+            return {}
+        
+        # Use a VecEnv for evaluate_policy, but can be n_envs=1
+        eval_vec_env = self._create_env(for_training=False, n_envs_override=1)
+        results = {}
+        try:
+            self.model = SB3_PPO.load(model_path_to_load, env=eval_vec_env, device=self.merged_hparams["device"]) # Pass env for structure
+            print(f"  PPO Model loaded for evaluation: {os.path.basename(model_path_to_load)}")
             
-            for start_idx in range(0, num_samples, self.mini_batch_size):
-                end_idx = min(start_idx + self.mini_batch_size, num_samples) # Handle last smaller batch
-                if start_idx == end_idx: continue # Skip if somehow start_idx >= num_samples
+            # evaluate_policy provides a good summary
+            # mean_reward_sb3, std_reward_sb3 = evaluate_policy(
+            #    self.model, eval_vec_env, n_eval_episodes=episodes, deterministic=True, render=False, warn=False
+            # )
 
-                mb_indices = indices[start_idx:end_idx]
+            # Manual loop for more detailed stats if needed
+            all_ep_rewards, all_ep_steps = [], []
+            print(f"  Running manual loop for detailed PPO stats over {episodes} episodes...")
+            for i in range(episodes):
+                obs = eval_vec_env.reset() # VecEnv obs is a list/array
+                terminated, truncated = np.array([False]), np.array([False]) # For VecEnv
+                episode_reward, episode_steps = 0, 0
+                while not (terminated[0] or truncated[0]) and episode_steps < max_steps_per_episode:
+                    action, _ = self.model.predict(obs, deterministic=True)
+                    obs, reward, terminated, truncated, info = eval_vec_env.step(action)
+                    episode_reward += reward[0]
+                    episode_steps += 1
+                actual_ep_reward = info[0].get('episode', {}).get('r', episode_reward)
+                actual_ep_steps = info[0].get('episode', {}).get('l', episode_steps)
+                all_ep_rewards.append(actual_ep_reward)
+                all_ep_steps.append(actual_ep_steps)
+                if (i + 1) % max(1, episodes // 5) == 0: # Print progress
+                    print(f"    PPO Eval Ep {i+1}/{episodes}: Score={actual_ep_reward:.0f}, Steps={actual_ep_steps}")
 
-                mb_states = states_t[mb_indices]
-                mb_actions = actions_t[mb_indices]
-                mb_old_log_probs = old_log_probs_t[mb_indices]
-                mb_advantages = normalized_advantages_t[mb_indices]
-                mb_returns = returns_t[mb_indices]
+            avg_s, std_s = (np.mean(all_ep_rewards), np.std(all_ep_rewards)) if all_ep_rewards else (0,0)
+            min_s, max_s = (np.min(all_ep_rewards), np.max(all_ep_rewards)) if all_ep_rewards else (0,0)
+            avg_st = np.mean(all_ep_steps) if all_ep_steps else 0
+            
+            # print(f"  PPO Eval (evaluate_policy): Mean Score: {mean_reward_sb3:.2f} +/- {std_reward_sb3:.2f}")
+            print(f"  PPO Eval (manual loop): Avg Score: {avg_s:.2f} +/- {std_s:.2f}")
+            print(f"    Min: {min_s:.2f}, Max: {max_s:.2f}, Avg Steps: {avg_st:.1f}")
 
-                # Get new log_probs, values, and entropy from current policy
-                new_action_logits, new_values_pred = self.network(mb_states) # V_phi(s_t)
-                
-                if torch.isnan(new_action_logits).any() or torch.isinf(new_action_logits).any():
-                    print(f"PPO LEARN DEBUG Epoch {epoch_num} MB {start_idx//self.mini_batch_size}: NaN/Inf in new_action_logits: {new_action_logits}")
-                    continue # Skip this minibatch if logits are bad
-                if torch.isnan(new_values_pred).any() or torch.isinf(new_values_pred).any():
-                    print(f"PPO LEARN DEBUG Epoch {epoch_num} MB {start_idx//self.mini_batch_size}: NaN/Inf in new_values_pred: {new_values_pred}")
-                    continue
+            results = {
+                "num_episodes_eval": episodes, "avg_score": round(avg_s, 2),
+                "std_dev_score": round(std_s, 2), "min_score": round(min_s, 2),
+                "max_score": round(max_s, 2), "avg_steps": round(avg_st, 1)
+            }
+        except Exception as e:
+            print(f"  Error during PPO evaluation: {e}")
+            import traceback; traceback.print_exc()
+        finally:
+            if eval_vec_env: eval_vec_env.close()
+        print(f"--- PPO Evaluation Ended ---")
+        return results
 
-                try:
-                    dist = Categorical(logits=new_action_logits)
-                except ValueError as e:
-                    print(f"PPO LEARN CRITICAL: ValueError creating Categorical. Logits: {new_action_logits}. Error: {e}")
-                    continue
-                
-                new_log_probs = dist.log_prob(mb_actions)
-                entropy = dist.entropy().mean()
-                new_values_pred = new_values_pred.squeeze(-1) # Shape: (mini_batch_size,)
 
-                # Ratio for PPO loss
-                log_ratio = new_log_probs - mb_old_log_probs
-                ratio = torch.exp(log_ratio)
-                if torch.isnan(ratio).any() or torch.isinf(ratio).any():
-                    print(f"PPO LEARN DEBUG: NaN/Inf in ratio. new_log_probs: {new_log_probs}, mb_old_log_probs: {mb_old_log_probs}")
-                    continue
-
-                # Clipped Surrogate Objective
-                surr1 = ratio * mb_advantages
-                surr2 = torch.clamp(ratio, 1.0 - self.ppo_clip, 1.0 + self.ppo_clip) * mb_advantages
-                actor_loss = -torch.min(surr1, surr2).mean()
-
-                # Value Function Loss
-                critic_loss = F.mse_loss(new_values_pred, mb_returns) # mb_returns are GAE-based targets
-                
-                # Total Loss
-                loss = actor_loss + self.value_loss_coef * critic_loss - self.entropy_coef * entropy
-                
-                if torch.isnan(loss).any() or torch.isinf(loss).any():
-                    print(f"PPO LEARN DEBUG: NaN/Inf in total loss. Actor: {actor_loss.item()}, Critic: {critic_loss.item()}, Entropy: {entropy.item()}")
-                    continue
-
-                self.optimizer.zero_grad()
-                loss.backward()
-                # Gradient clipping (helps with exploding gradients)
-                torch.nn.utils.clip_grad_norm_(self.network.parameters(), max_norm=0.5) # Value from original stable-baselines
-                self.optimizer.step()
-                
-                total_loss_accumulator += loss.item()
-                num_minibatches += 1
-        
-        return total_loss_accumulator / num_minibatches if num_minibatches > 0 else 0.0
+    def choose_action(self, observation, deterministic=False):
+        if self.model is None:
+            if self.action_size is None: return 0 # Fallback
+            return np.random.choice(self.action_size)
+        action, _states = self.model.predict(observation, deterministic=deterministic)
+        return action
 
     def save(self, path):
-        torch.save(self.network.state_dict(), path)
-        print(f"PPO model saved to {path}")
+        if self.model and path:
+            try:
+                os.makedirs(os.path.dirname(path), exist_ok=True)
+                self.model.save(path)
+                print(f"  PPO Agent (SB3) model saved to {os.path.basename(path)}")
+            except Exception as e: print(f"  Error saving PPO model to {path}: {e}")
+        elif not self.model: print("  PPO save attempt: model not initialized.")
+        elif not path: print("  PPO save attempt: no path provided.")
 
     def load(self, path):
-        try:
-            self.network.load_state_dict(torch.load(path, map_location=self.device))
-            self.network.train() # Set to train mode after loading
-            print(f"PPO model loaded from {path}")
-        except Exception as e:
-            print(f"Error loading PPO model from {path}: {e}")
+        if path and os.path.exists(path):
+            try:
+                print(f"  PPO Agent (SB3) loading model from {os.path.basename(path)}.")
+                # PPO models can often be loaded without an env if standard CnnPolicy
+                self.model = SB3_PPO.load(path, device=self.merged_hparams["device"])
+                print(f"  PPO Model loaded successfully.")
+            except Exception as e:
+                print(f"  Error loading PPO model from {path}: {e}")
+                import traceback; traceback.print_exc()
+                self.model = None
+        elif not path: print("  PPO load: path is None.")
+        else: print(f"  PPO load: path does not exist: {path}")

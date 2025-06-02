@@ -5,9 +5,15 @@ description = "Add your description here"
 readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
+    "ale-py>=0.11.1",
+    "gym>=0.26.2",
+    "gymnasium[accept-rom-license,atari]>=1.1.1",
     "imageio>=2.37.0",
+    "matplotlib>=3.10.3",
+    "neat-python>=0.92",
     "numpy>=2.2.6",
     "pillow>=11.2.1",
     "pygame>=2.6.1",
+    "stable-baselines3[extra]>=2.6.0",
     "torch>=2.7.0",
 ]

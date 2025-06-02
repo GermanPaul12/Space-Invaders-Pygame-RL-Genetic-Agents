@@ -1,529 +1,374 @@
 # agents/neat_agent.py
-import numpy as np
+import os
+import time
+import json
 import random
-import math
-from collections import defaultdict
-from copy import deepcopy
+import gymnasium as gym
+from gymnasium.wrappers import RecordVideo, RecordEpisodeStatistics
+import numpy as np
+from PIL import Image
 import pickle
 
-from .agent import Agent
-from .dqn_agent import preprocess_observation # Assuming this is picklable
+try:
+    import neat
+except ImportError:
+    print("Error: neat-python library not found. Please install it with 'pip install neat-python'")
+    # Define dummy classes if neat is not available to prevent import errors if Agent is instantiated
+    class neat:
+        class Population: pass
+        class Config: pass
+        class DefaultGenome: pass
+        class nn:
+            class FeedForwardNetwork:
+                @staticmethod
+                def create(genome, config): pass
+    # Raise an error or exit if neat is critical and not found
+    # raise ImportError("neat-python is required for NEATAgent.")
 
-# GlobalInnovation class remains the same, it's instantiated per NEATAgent now.
-class GlobalInnovation:
-    def __init__(self): self.innovation_number = 0; self.node_innovation_count = 0; self.node_innovations = {}; self.connection_innovations = {}
-    def reset(self, num_input_nodes, num_output_nodes): self.innovation_number = 0; self.node_innovation_count = num_input_nodes + num_output_nodes; self.node_innovations = {}; self.connection_innovations = {}
-    def get_connection_innov(self, in_node_id, out_node_id):
-        key = (in_node_id, out_node_id)
-        if key not in self.connection_innovations: self.connection_innovations[key] = self.innovation_number; self.innovation_number += 1
-        return self.connection_innovations[key]
-    def get_node_innov(self, connection_gene_to_split):
-        key = (connection_gene_to_split.in_node, connection_gene_to_split.out_node)
-        if key not in self.node_innovations: self.node_innovations[key] = self.node_innovation_count; self.node_innovation_count += 1
-        return self.node_innovations[key]
 
-class ConnectionGene:
-    def __init__(self, in_node, out_node, weight, enabled=True, innovation_tracker_ref=None): # Changed tracker
-        self.in_node, self.out_node, self.weight, self.enabled = in_node, out_node, weight, enabled
-        if innovation_tracker_ref: self.innovation = innovation_tracker_ref.get_connection_innov(in_node, out_node)
-        else: raise ValueError("ConnectionGene requires an innovation_tracker_ref") # Must be provided
-    def clone(self):
-        cloned = ConnectionGene(self.in_node, self.out_node, self.weight, self.enabled)
-        cloned.innovation = self.innovation # Crucial: preserve innovation on clone
-        return cloned
+from .agent import Agent # Your base Agent class
 
-class NodeGene: # (As in your last correct version, using activation_func_name)
-    def __init__(self, id, type="hidden", activation_func_name="tanh"):
-        self.id, self.type = id, type
-        self.value, self.inputs_received = 0.0, []
-        if activation_func_name == "tanh": self.activation_func = np.tanh
-        elif activation_func_name == "sigmoid": self.activation_func = lambda x: 1/(1 + np.exp(-x))
-        elif activation_func_name == "relu": self.activation_func = lambda x: np.maximum(0,x)
-        elif activation_func_name == "linear": self.activation_func = lambda x: x
-        else: self.activation_func = np.tanh 
-    def activate(self):
-        if self.type == "input": pass
-        else: self.value = self.activation_func(sum(self.inputs_received))
-        self.inputs_received = []
-        return self.value
+# --- Preprocessing ---
+def preprocess_observation_neat(obs, new_size=(84, 84), flatten=True):
+    if obs is None:
+        flat_size = new_size[0] * new_size[1] if flatten else 1
+        return np.zeros(flat_size if flatten else (1, new_size[0], new_size[1]), dtype=np.float32)
+    if isinstance(obs, tuple):
+        obs = obs[0]
 
-class GenomeNEAT:
-    def __init__(self, num_inputs, num_outputs, agent_ref): # agent_ref is now mandatory
-        self.num_inputs, self.num_outputs = num_inputs, num_outputs
-        self.agent_ref = agent_ref # NEATAgent instance
-        self.connection_genes, self.node_genes = {}, {}
-        self.fitness, self.adjusted_fitness, self.species_id = 0.0, 0.0, None
+    img = Image.fromarray(obs)
+    img = img.convert('L')
+    img = img.resize(new_size, Image.Resampling.LANCZOS)
+    img_array = np.array(img, dtype=np.float32) / 255.0
+    
+    if flatten:
+        return img_array.flatten()
+    else:
+        return np.expand_dims(img_array, axis=0) # (1, H, W)
 
-        for i in range(self.num_inputs): self.node_genes[i] = NodeGene(i, type="input")
-        for i in range(self.num_inputs, self.num_inputs + self.num_outputs):
-            self.node_genes[i] = NodeGene(i, type="output", activation_func_name=self.agent_ref.output_activation)
+
+class NEATAgent(Agent):
+    _default_neat_hparams = {
+        "max_generations": 100,
+        "max_steps_per_eval": 2000,
+        "neat_config_file": "configs/neat_config.txt", # Default path, relative to ROOT_DIR
+        "checkpoint_prefix": "neat_checkpoint_",
+        "save_best_genome_filename": "best_neat_genome.pkl"
+    }
+    DEFAULT_ENV_ID = "ALE/SpaceInvaders-v5"
+
+    def __init__(self, env_id, hparams, mode, models_dir_for_agent, gifs_dir_for_agent):
+        super().__init__(env_id if env_id else self.DEFAULT_ENV_ID,
+                         hparams, mode, models_dir_for_agent, gifs_dir_for_agent)
+
+        if 'neat' not in globals() or not hasattr(neat, 'Config'): # Check if neat imported correctly
+            raise ImportError("neat-python is required for NEATAgent but was not imported successfully.")
+
+        self.merged_hparams = self._default_neat_hparams.copy()
+        self.merged_hparams.update(self.hparams)
+
+        # NEAT config path needs to be absolute or relative to a known root
+        config_file_path = self.merged_hparams["neat_config_file"]
+        if not os.path.isabs(config_file_path):
+            # Assuming ROOT_DIR is defined where main.py is, and this agent is in agents/
+            # So, go up one level from self.models_dir (which is ROOT_DIR/models) to get ROOT_DIR
+            project_root_dir = os.path.dirname(self.models_dir) if self.models_dir else "."
+            config_file_path = os.path.join(project_root_dir, config_file_path)
         
-        if self.agent_ref.initial_connection_type == "full":
-            for i_node_id in range(self.num_inputs):
-                for o_node_id in range(self.num_inputs, self.num_inputs + self.num_outputs):
-                    weight = np.random.uniform(-1, 1) # Use configured range
-                    gene = ConnectionGene(i_node_id, o_node_id, weight, innovation_tracker_ref=self.agent_ref.innovation_tracker)
-                    self.connection_genes[gene.innovation] = gene
-
-    def feed_forward(self, inputs_flat):
-        if len(inputs_flat) != self.num_inputs: raise ValueError(f"Input size mismatch")
-        for node in self.node_genes.values(): 
-            if node.type != "input": node.value = 0.0; node.inputs_received = []
-        for i in range(self.num_inputs): self.node_genes[i].value = inputs_flat[i]
+        if not os.path.exists(config_file_path):
+            raise FileNotFoundError(f"NEAT configuration file not found at: {config_file_path}. "
+                                    "Please create it. A sample is in neat_agent.py comments.")
         
-        # More robust feedforward using node depths or multiple passes
-        # For now, using the pass count from agent_ref
-        for _ in range(self.agent_ref.ff_passes):
-            for node_id in sorted(self.node_genes.keys()): # Process in ID order (basic topological for non-recurrent)
-                node = self.node_genes[node_id]
-                if node.type == "input": continue
-                current_val_before_activate = sum(node.inputs_received) # Sum before clearing
-                node.inputs_received = [] # Clear for this node for this pass
-                node.value = node.activation_func(current_val_before_activate)
-
-                # Propagate output
-                for gene in self.connection_genes.values():
-                    if gene.enabled and gene.in_node == node_id:
-                        # Check if out_node exists; essential for dynamic topologies
-                        if gene.out_node in self.node_genes:
-                             self.node_genes[gene.out_node].inputs_received.append(gene.weight * node.value)
-                        # else: print_f(f"Warning: Genome {id(self)} feed_forward found connection to non-existent node {gene.out_node}")
-
-
-        outputs = []
-        for i in range(self.num_inputs, self.num_inputs + self.num_outputs):
-            # Final activation for output nodes if they received new inputs
-            # This ensures they use the latest summed inputs from the final pass
-            out_node = self.node_genes[i]
-            if out_node.inputs_received : # Only activate if there are new inputs from last propagation
-                out_node.activate() # This will sum inputs_received and clear it
-            outputs.append(out_node.value)
-        return outputs
-
-    def mutate(self): # Uses self.agent_ref for rates and innovation_tracker
-        # ... (Weight mutation logic, using self.agent_ref.weight_mutate_rate etc.) ...
-        for gene in self.connection_genes.values():
-            if np.random.rand() < self.agent_ref.weight_mutate_rate:
-                gene.weight += np.random.uniform(-self.agent_ref.weight_perturb_strength, self.agent_ref.weight_perturb_strength) if np.random.rand() < self.agent_ref.weight_perturb_uniform_rate else np.random.uniform(-self.agent_ref.weight_random_range, self.agent_ref.weight_random_range)
-                gene.weight = np.clip(gene.weight, -self.agent_ref.max_weight, self.agent_ref.max_weight) # Clip weights
-            if gene.enabled and np.random.rand() < self.agent_ref.disable_mutate_rate: gene.enabled = False
-            elif not gene.enabled and np.random.rand() < self.agent_ref.enable_mutate_rate: gene.enabled = True
-
-        if np.random.rand() < self.agent_ref.add_connection_mutate_rate:
-            self._mutate_add_connection() # Will use self.agent_ref.innovation_tracker
-        if np.random.rand() < self.agent_ref.add_node_mutate_rate:
-            self._mutate_add_node() # Will use self.agent_ref.innovation_tracker
-
-    def _mutate_add_connection(self):
-        # ... (Logic as before, but ConnectionGene now requires innovation_tracker_ref)
-        possible_in_nodes = [nid for nid, n in self.node_genes.items() if n.type != "output"]
-        possible_out_nodes = [nid for nid, n in self.node_genes.items() if n.type != "input"]
-        if not possible_in_nodes or not possible_out_nodes: return
-        for _ in range(10): # Attempts
-            in_id = random.choice(possible_in_nodes)
-            out_id = random.choice(possible_out_nodes)
-            if in_id == out_id: continue # No self-loops on same node via this mutation
-            # Check if this connection would create a direct cycle to an input node (not allowed)
-            # or if it's from an output node (also typically not allowed for initial connections)
-            if self.node_genes[out_id].type == "input": continue
-            if self.node_genes[in_id].type == "output" and self.node_genes[out_id].type != "output" and not self.agent_ref.allow_recurrent_connections_on_mutate : continue
-
-
-            existing = False
-            for gene in self.connection_genes.values():
-                if gene.in_node == in_id and gene.out_node == out_id: existing = True; break
-            if existing: continue
-
-            weight = np.random.uniform(-self.agent_ref.weight_random_range, self.agent_ref.weight_random_range)
-            new_gene = ConnectionGene(in_id, out_id, weight, innovation_tracker_ref=self.agent_ref.innovation_tracker)
-            self.connection_genes[new_gene.innovation] = new_gene
-            break # Added connection
-
-    def _mutate_add_node(self):
-        # ... (Logic as before, ConnectionGene requires innovation_tracker_ref)
-        if not self.connection_genes: return
-        enabled_genes = [g for g in self.connection_genes.values() if g.enabled]
-        if not enabled_genes: return
-        gene_to_split = random.choice(enabled_genes)
-        gene_to_split.enabled = False
+        self.neat_config = neat.Config(neat.DefaultGenome, neat.DefaultReproduction,
+                                       neat.DefaultSpeciesSet, neat.DefaultStagnation,
+                                       config_file_path)
         
-        new_node_id = self.agent_ref.innovation_tracker.get_node_innov(gene_to_split)
-        if new_node_id in self.node_genes: gene_to_split.enabled = True; return # Collision
-        
-        self.node_genes[new_node_id] = NodeGene(new_node_id, type="hidden", activation_func_name=self.agent_ref.hidden_activation)
-        
-        gene1 = ConnectionGene(gene_to_split.in_node, new_node_id, 1.0, innovation_tracker_ref=self.agent_ref.innovation_tracker)
-        gene2 = ConnectionGene(new_node_id, gene_to_split.out_node, gene_to_split.weight, innovation_tracker_ref=self.agent_ref.innovation_tracker)
-        self.connection_genes[gene1.innovation] = gene1
-        self.connection_genes[gene2.innovation] = gene2
+        # Verify num_inputs and num_outputs match environment
+        temp_env = gym.make(self.env_id)
+        self.action_size = temp_env.action_space.n
+        # Preprocessed and flattened observation size
+        self.flat_obs_size = 84 * 84 
+        temp_env.close()
 
-    def clone(self):
-        # ... (Logic as before, ensure agent_ref is handled, and NodeGene takes activation_func_name)
-        cloned_genome = GenomeNEAT(self.num_inputs, self.num_outputs, self.agent_ref)
-        cloned_genome.node_genes = {}
-        for nid, node_obj in self.node_genes.items():
-            # Get original activation name string
-            activation_name_str = "tanh" # default
-            if node_obj.type == "output": activation_name_str = self.agent_ref.output_activation
-            elif node_obj.type == "hidden": activation_name_str = self.agent_ref.hidden_activation
-            cloned_genome.node_genes[nid] = NodeGene(node_obj.id, node_obj.type, activation_func_name=activation_name_str)
-        cloned_genome.connection_genes = {innov: gene.clone() for innov, gene in self.connection_genes.items()}
-        return cloned_genome
+        if self.neat_config.genome_config.num_inputs != self.flat_obs_size:
+            raise ValueError(f"NEAT config num_inputs ({self.neat_config.genome_config.num_inputs}) "
+                             f"does not match expected flat observation size ({self.flat_obs_size}). Adjust neat_config.txt.")
+        if self.neat_config.genome_config.num_outputs != self.action_size:
+            raise ValueError(f"NEAT config num_outputs ({self.neat_config.genome_config.num_outputs}) "
+                             f"does not match environment action size ({self.action_size}). Adjust neat_config.txt.")
 
+        print(f"  NEAT Agent: Env '{self.env_id}', Action Size: {self.action_size}, Flat Obs Size: {self.flat_obs_size}")
 
-def crossover_neat(parent1, parent2, agent_ref_for_child): # Pass agent_ref for child
-    # ... (Logic as before, GenomeNEAT child needs agent_ref)
-    if parent2.fitness > parent1.fitness: parent1, parent2 = parent2, parent1
-    child = GenomeNEAT(parent1.num_inputs, parent1.num_outputs, agent_ref_for_child) # Pass agent_ref
-    child.connection_genes = {} # Clear any default connections
-    # ... (rest of crossover for connections, ensure child_gene.innovation is preserved from cloned parent gene)
-    for innov1, gene1 in parent1.connection_genes.items():
-        gene2 = parent2.connection_genes.get(innov1)
-        if gene2 is not None: # Matching gene
-            chosen_parent_gene = random.choice([gene1, gene2])
-            child_gene = chosen_parent_gene.clone()
-            # Handle disabled genes
-            if not gene1.enabled or not gene2.enabled:
-                if np.random.rand() < 0.75: # Chance to inherit disabled status from either parent
-                    child_gene.enabled = False
-                # else: it remains enabled (from the clone)
-        else: # Disjoint or excess gene from parent1
-            child_gene = gene1.clone()
-        child.connection_genes[child_gene.innovation] = child_gene # Use innovation of the gene itself
-
-    # Rebuild node gene dictionary for child based on connections and I/O nodes
-    child.node_genes = {}
-    # Add input nodes
-    for i in range(child.num_inputs):
-        child.node_genes[i] = NodeGene(i, type="input")
-    # Add output nodes
-    for i in range(child.num_inputs, child.num_inputs + child.num_outputs):
-        child.node_genes[i] = NodeGene(i, type="output", activation_func_name=agent_ref_for_child.output_activation)
-    # Add hidden nodes implied by connections
-    for gene in child.connection_genes.values():
-        for node_id in [gene.in_node, gene.out_node]:
-            if node_id not in child.node_genes: # If it's a hidden node not yet added
-                 child.node_genes[node_id] = NodeGene(node_id, type="hidden", activation_func_name=agent_ref_for_child.hidden_activation)
-    return child
-
-
-def compatibility_distance(genome1, genome2, agent_ref_for_coeffs): # Pass agent_ref
-    # ... (Logic as before, using agent_ref_for_coeffs.excess_coef etc.)
-    innov1 = set(genome1.connection_genes.keys()); innov2 = set(genome2.connection_genes.keys())
-    max_innov_g1 = max(innov1) if innov1 else -1; max_innov_g2 = max(innov2) if innov2 else -1
-    disjoint, excess, matching_innovs = 0,0,[]
-    all_innovs = innov1 | innov2
-    for innov in sorted(list(all_innovs)):
-        g1_has = innov in innov1; g2_has = innov in innov2
-        if g1_has and g2_has: matching_innovs.append(innov)
-        elif g1_has and innov > max_innov_g2: excess +=1
-        elif g2_has and innov > max_innov_g1: excess +=1
-        else: disjoint +=1
-    weight_diff_sum = sum(abs(genome1.connection_genes[i].weight - genome2.connection_genes[i].weight) for i in matching_innovs)
-    avg_w_diff = (weight_diff_sum / len(matching_innovs)) if matching_innovs else 0
-    N = max(len(genome1.connection_genes), len(genome2.connection_genes)); N = 1 if N < 1 else N # N should be at least 1
-    return ( (agent_ref_for_coeffs.excess_coef * excess / N) + 
-             (agent_ref_for_coeffs.disjoint_coef * disjoint / N) + 
-             (agent_ref_for_coeffs.weight_diff_coef * avg_w_diff) )
-
-class SpeciesNEAT: # (As before, ensure it uses agent_ref for its parameters)
-    def __init__(self, representative_genome, species_id, agent_ref):
-        self.id, self.agent_ref = species_id, agent_ref
-        self.representative = representative_genome.clone()
-        self.members = [representative_genome]
-        self.generations_since_improvement, self.max_fitness_achieved = 0, -float('inf')
-        representative_genome.species_id = self.id # Assign species ID to the genome
-    def add_member(self, genome): self.members.append(genome); genome.species_id = self.id
-    def calculate_shared_fitness(self):
-        for m in self.members: m.adjusted_fitness = m.fitness / len(self.members) if self.members else 0.0
-    def get_average_fitness(self): return sum(m.fitness for m in self.members) / len(self.members) if self.members else 0.0
-    def get_champion(self): return max(self.members, key=lambda m: m.fitness) if self.members else None
-    def sort_members_by_fitness(self): self.members.sort(key=lambda m: m.fitness, reverse=True)
-    def check_stagnation(self):
-        champ = self.get_champion()
-        current_max = champ.fitness if champ else -float('inf')
-        if current_max > self.max_fitness_achieved: self.max_fitness_achieved = current_max; self.generations_since_improvement = 0
-        else: self.generations_since_improvement += 1
-        return self.generations_since_improvement > self.agent_ref.stagnation_threshold
-
-
-class NEATAgent(Agent): # (As in your last correct version, accepting **kwargs)
-    def __init__(self, action_size, observation_shape, **kwargs):
-        super().__init__(action_size, observation_shape)
-        # --- Set NEAT parameters from kwargs or use defaults ---
-        self.population_size = kwargs.get("population_size", 50)
-        self.compatibility_threshold = kwargs.get("compatibility_threshold", 3.0)
-        self.excess_coef = kwargs.get("excess_coef", 1.0)
-        self.disjoint_coef = kwargs.get("disjoint_coef", 1.0)
-        self.weight_diff_coef = kwargs.get("weight_diff_coef", 0.4)
-        self.stagnation_threshold = kwargs.get("stagnation_threshold", 15)
-        self.min_species_size_for_champion = kwargs.get("min_species_size_for_champion", 5)
-        self.add_connection_mutate_rate = kwargs.get("add_connection_mutate_rate", 0.1)
-        self.add_node_mutate_rate = kwargs.get("add_node_mutate_rate", 0.05)
-        self.weight_mutate_rate = kwargs.get("weight_mutate_rate", 0.8)
-        self.weight_perturb_uniform_rate = kwargs.get("weight_perturb_uniform_rate", 0.9)
-        self.weight_perturb_strength = kwargs.get("weight_perturb_strength", 0.1) # Added for mutate
-        self.weight_random_range = kwargs.get("weight_random_range", 2.0) # Added for mutate
-        self.max_weight = kwargs.get("max_weight", 5.0) # Added for mutate (weight clipping)
-        self.enable_mutate_rate = kwargs.get("enable_mutate_rate", 0.05)
-        self.disable_mutate_rate = kwargs.get("disable_mutate_rate", 0.01)
-        self.crossover_rate = kwargs.get("crossover_rate", 0.75)
-        self.interspecies_mate_rate = kwargs.get("interspecies_mate_rate", 0.001)
-        self.elitism_species_percent = kwargs.get("elitism_species_percent", 0.1) # Elites from best species
-        self.elitism_genome_percent_in_species = kwargs.get("elitism_genome_percent_in_species", 0.1) # Elites within a species
-        self.initial_connection_type = kwargs.get("initial_connection_type", "full")
-        self.output_activation = kwargs.get("output_activation", "tanh")
-        self.hidden_activation = kwargs.get("hidden_activation", "tanh")
-        self.ff_passes = kwargs.get("ff_passes", 3)
-        self.allow_recurrent_connections_on_mutate = kwargs.get("allow_recurrent_connections_on_mutate", False) # Default to False for simpler initial networks
-
-        self.explore_gens_random = kwargs.get("explore_gens_random", 3)       # NEW: Generations for purely random actions
-        self.explore_gens_stochastic = kwargs.get("explore_gens_stochastic", 5) # Total gens for any exploration (random then stochastic)
-        self.action_explore_temp = kwargs.get("action_explore_temp", 1.0)
-        if self.action_explore_temp <= 0: self.action_explore_temp = 1e-6
-        # Ensure stochastic exploration doesn't overlap incorrectly with random
-        if self.explore_gens_stochastic <= self.explore_gens_random:
-            self.explore_gens_stochastic = self.explore_gens_random + 2 # Ensure stochastic phase is after random
-
-        self.num_inputs = observation_shape[1] * observation_shape[2]
-        self.num_outputs = action_size
-        self.innovation_tracker = GlobalInnovation() # Instance specific tracker
-        self.innovation_tracker.reset(self.num_inputs, self.num_outputs)
-
-        self.population = [GenomeNEAT(self.num_inputs, self.num_outputs, agent_ref=self) for _ in range(self.population_size)]
-        self.species = []
-        self.current_genome_idx = 0
-        self.current_generation = 0
-        self.best_fitness_overall = -float('inf')
+        self.population = None # Will be initialized or loaded in train/load
         self.best_genome_overall = None
-        self.processed_h, self.processed_w = observation_shape[1], observation_shape[2]
-        print(f"NEAT Agent: Pop: {self.population_size}, Inputs: {self.num_inputs}, Outputs: {self.num_outputs}")
+        self.current_generation = 0
+        self.active_net = None # For choose_action during test/eval
 
-    def get_node_activation_name(self, node_id): # Helper for GenomeNEAT.clone
-        if node_id < self.num_inputs: return "linear" # Or None, inputs don't 'activate' via func
-        if node_id < self.num_inputs + self.num_outputs: return self.output_activation
-        return self.hidden_activation
+        self.checkpoint_dir = os.path.join(self.models_dir, "neat_checkpoints")
+        os.makedirs(self.checkpoint_dir, exist_ok=True)
+        self.best_genome_save_path = os.path.join(self.models_dir, self.merged_hparams["save_best_genome_filename"])
 
-    def choose_action(self, raw_observation):
-        if self.current_genome_idx >= len(self.population) or self.current_genome_idx < 0:
-            return random.randrange(self.action_size) 
 
-        current_genome = self.population[self.current_genome_idx]
-        action = 0 
+    def get_model_file_extension(self):
+        # NEAT uses its own checkpointing. We also save the best genome as .pkl.
+        return ".pkl" # For the best_genome file
 
-        # self.is_evaluating is set by episode_runner for test/eval runs
-        if self.is_evaluating: # Always greedy (use network) if in pure evaluation/test mode
-            processed_obs_np = preprocess_observation(raw_observation, new_size=(self.processed_h, self.processed_w))
-            flat_input = processed_obs_np.flatten()
-            network_outputs = np.array(current_genome.feed_forward(flat_input), dtype=np.float64)
-            action = np.argmax(network_outputs)
-        elif self.current_generation < self.explore_gens_random:
-            # --- Purely Random Exploration Phase ---
-            action = random.randrange(self.action_size)
-            # Optional: Print during this phase
-            # if self.current_generation < 1 and self.current_genome_idx < 2: # Example print condition
-            #     print(f"  NEAT G{self.current_generation} I{self.current_genome_idx} (Random Action): {action}")
-        elif self.current_generation < self.explore_gens_stochastic:
-            # --- Stochastic (Softmax) Exploration Phase ---
-            processed_obs_np = preprocess_observation(raw_observation, new_size=(self.processed_h, self.processed_w))
-            flat_input = processed_obs_np.flatten()
-            network_outputs = np.array(current_genome.feed_forward(flat_input), dtype=np.float64)
+    def _eval_genomes(self, genomes, config):
+        """ Evaluates a list of genomes, assigning fitness. Called by NEAT. """
+        eval_env = gym.make(self.env_id, render_mode="rgb_array", full_action_space=False) # Headless for speed
+        max_steps = self.merged_hparams['max_steps_per_eval']
+
+        for genome_id, genome in genomes:
+            net = neat.nn.FeedForwardNetwork.create(genome, config)
+            genome.fitness = 0.0 # Start with zero fitness
+
+            obs, info = eval_env.reset()
+            current_obs_p_flat = preprocess_observation_neat(obs, flatten=True)
+            total_reward = 0
             
-            stable_logits = network_outputs - np.max(network_outputs)
-            exp_logits = np.exp(stable_logits / self.action_explore_temp)
-            sum_exp_logits = np.sum(exp_logits)
+            for _ in range(max_steps):
+                outputs = net.activate(current_obs_p_flat)
+                action = np.argmax(outputs) # Choose action with highest activation
+                
+                next_obs_raw, reward, terminated, truncated, info = eval_env.step(action)
+                total_reward += reward
+                current_obs_p_flat = preprocess_observation_neat(next_obs_raw, flatten=True)
+                
+                if terminated or truncated:
+                    break
+            genome.fitness = total_reward
+        eval_env.close()
 
-            if sum_exp_logits == 0 or np.isnan(sum_exp_logits) or np.isinf(sum_exp_logits):
-                action = random.randrange(self.action_size)
-            else:
-                probs = exp_logits / sum_exp_logits
-                if np.isnan(probs).any() or not np.isclose(np.sum(probs), 1.0):
-                    action = random.randrange(self.action_size)
-                else:
-                    try:
-                        action = np.random.choice(self.action_size, p=probs)
-                    except ValueError:
-                        action = random.randrange(self.action_size)
-        else: 
-            # --- Standard Greedy Action (Exploitation Phase after exploration) ---
-            processed_obs_np = preprocess_observation(raw_observation, new_size=(self.processed_h, self.processed_w))
-            flat_input = processed_obs_np.flatten()
-            network_outputs = np.array(current_genome.feed_forward(flat_input), dtype=np.float64)
-            action = np.argmax(network_outputs)
-            
+
+    def train(self, episodes, max_steps_per_episode, render_mode_str, # episodes is generations
+              path_to_load_model, force_new_training_if_model_exists,
+              save_interval_eps, print_interval_steps, **kwargs): # print_interval for stats reporter
+
+        num_generations = episodes if episodes > 0 else self.merged_hparams['max_generations']
+        # max_steps_per_episode is used by _eval_genomes as max_steps_per_eval
+        self.merged_hparams['max_steps_per_eval'] = max_steps_per_episode if max_steps_per_episode > 0 else self.merged_hparams['max_steps_per_eval']
+
+        print(f"\n--- NEAT Training Started ---")
+        print(f"  Generations: {num_generations}, Max Steps/Genome Eval: {self.merged_hparams['max_steps_per_eval']}")
+        print(f"  NEAT Config: {self.merged_hparams['neat_config_file']}")
+
+        # Load population or create new
+        loaded_checkpoint = None
+        if path_to_load_model and os.path.exists(path_to_load_model) and not force_new_training_if_model_exists:
+            # path_to_load_model for NEAT usually means a checkpoint file, or our best_genome.pkl
+            if path_to_load_model.endswith(".pkl"): # It's our best_genome.pkl, not a population checkpoint
+                print(f"  Loading best genome from {path_to_load_model}, but NEAT needs a population to continue training.")
+                print(f"  Will start new population unless a NEAT checkpoint is also found.")
+                self.load(path_to_load_model) # Loads self.best_genome_overall
+                # Now try to find a numeric checkpoint to resume population training
+                checkpoints = [f for f in os.listdir(self.checkpoint_dir) if f.startswith(self.merged_hparams["checkpoint_prefix"])]
+                if checkpoints:
+                    latest_checkpoint_num = max([int(f.split('_')[-1]) for f in checkpoints])
+                    loaded_checkpoint = os.path.join(self.checkpoint_dir, f"{self.merged_hparams['checkpoint_prefix']}{latest_checkpoint_num}")
+            elif path_to_load_model.startswith(self.merged_hparams["checkpoint_prefix"]): # It is a checkpoint
+                loaded_checkpoint = os.path.join(self.checkpoint_dir, os.path.basename(path_to_load_model))
+            else: # Unrecognized, assume it's a best_genome.pkl
+                self.load(path_to_load_model)
+
+        if loaded_checkpoint and os.path.exists(loaded_checkpoint):
+            print(f"  Restoring NEAT population from checkpoint: {loaded_checkpoint}")
+            self.population = neat.Checkpointer.restore_checkpoint(loaded_checkpoint)
+            self.current_generation = self.population.generation
+        else:
+            if force_new_training_if_model_exists and path_to_load_model:
+                 print(f"  Force new training specified. Ignoring potential load path {path_to_load_model} for population.")
+            print("  Creating new NEAT population.")
+            self.population = neat.Population(self.neat_config)
+            self.current_generation = 0
+            self.best_genome_overall = None # Reset if starting fresh
+
+        # Add reporters for output
+        self.population.add_reporter(neat.StdOutReporter(True))
+        stats = neat.StatisticsReporter()
+        self.population.add_reporter(stats)
+        # Checkpoint interval: NEAT's Checkpointer saves every N generations if generation_interval is set.
+        # save_interval_eps from main.py can map to this.
+        checkpoint_interval = save_interval_eps if save_interval_eps > 0 else num_generations # Save at end if 0
+        self.population.add_reporter(neat.Checkpointer(generation_interval=checkpoint_interval,
+                                                       time_interval_seconds=None, # No time-based checkpointing
+                                                       filename_prefix=os.path.join(self.checkpoint_dir, self.merged_hparams["checkpoint_prefix"])))
+        
+        start_generation_for_run = self.population.generation # Generation number from loaded pop
+        generations_to_run = num_generations - start_generation_for_run
+
+        if generations_to_run <=0:
+            print(f"  Loaded population is already at or beyond target generation {num_generations}. Training complete.")
+            if self.population.best_genome: self.best_genome_overall = self.population.best_genome
+        else:
+            print(f"  Running NEAT evolution for {generations_to_run} more generations (up to gen {num_generations}).")
+            try:
+                winner_genome = self.population.run(self._eval_genomes, generations_to_run)
+                if winner_genome:
+                    self.best_genome_overall = winner_genome # Store the overall best
+                print(f"\n--- NEAT Training Finished ---")
+                if self.best_genome_overall:
+                    print(f"Best genome found: ID {self.best_genome_overall.key}, Fitness: {self.best_genome_overall.fitness:.2f}")
+                else: # Could happen if evolution stops early or no clear winner
+                    print("No single best genome returned by population.run. Checking population's best.")
+                    if self.population.best_genome:
+                        self.best_genome_overall = self.population.best_genome
+                        print(f"Best genome from population: ID {self.best_genome_overall.key}, Fitness: {self.best_genome_overall.fitness:.2f}")
+
+
+            except KeyboardInterrupt:
+                print("\n  NEAT Training interrupted by user.")
+            except Exception as e:
+                print(f"  An error occurred during NEAT training: {e}")
+                import traceback; traceback.print_exc()
+            finally:
+                 # Save best genome explicitly, as NEAT's checkpointer only saves population
+                if self.best_genome_overall is None and self.population and self.population.best_genome:
+                    self.best_genome_overall = self.population.best_genome # Ensure we have the best from the run
+                self.save(self.best_genome_save_path) # Saves the best_genome_overall via .pkl
+
+    def choose_action(self, observation_preprocessed_flat, deterministic=True):
+        if self.active_net is None:
+            # This can happen if test/evaluate is called without loading a model/genome
+            # Or if called directly after init before any training or loading.
+            print("Warning: NEAT active_net not set. Choosing random action.")
+            return random.randrange(self.action_size)
+        
+        outputs = self.active_net.activate(observation_preprocessed_flat)
+        action = np.argmax(outputs)
         return action
 
-    def record_fitness(self, score): # Called by train.py after worker evaluates a genome
-        # This method now assumes train.py will assign fitness to self.population[some_index].fitness
-        # and then update current_genome_idx. This method is more for bookkeeping if called directly.
-        # In the parallel setup, train.py will directly update fitnesses.
-        # This method is effectively superseded by train.py's direct fitness assignment for parallel NEAT.
-        # However, NEATAgent still needs to track its best_fitness_overall.
-        # The train.py loop for NEAT will update self.best_fitness_overall and self.best_genome_overall.
+    def test(self, model_path_to_load, episodes, max_steps_per_episode,
+             render_during_test, record_video_flag, video_fps, **kwargs):
+        print(f"\n--- NEAT Testing ---")
         
-        # This is called by train.py for EACH genome after its fitness is known
-        # The `current_genome_idx` here refers to the conceptual index if we were iterating serially.
-        # Since train.py assigns all fitnesses, then calls learn(), current_genome_idx here isn't the driver.
-        # Let's assume train.py has updated the fitness for population[self.current_genome_idx]
-        # current_genome_fitness = self.population[self.current_genome_idx].fitness
-        # if current_genome_fitness > self.best_fitness_overall:
-        #     self.best_fitness_overall = current_genome_fitness
-        #     self.best_genome_overall = self.population[self.current_genome_idx].clone()
-        # self.current_genome_idx += 1 # This will be reset in learn() or managed by train.py's generation loop
-        pass # Fitness assignment and best tracking is now handled in train.py's NEAT loop
-
-    def learn(self): # Evolution step - called by train.py AFTER all genomes have fitness assigned
-        # No check for current_genome_idx needed here, train.py ensures all are evaluated.
-        self.current_generation += 1
-        self._speciate_population()
-        if not self.species: # Check if all species died out
-            print(f"  All species died out! Re-initializing NEAT population.")
-            self.population = [GenomeNEAT(self.num_inputs, self.num_outputs, agent_ref=self) for _ in range(self.population_size)]
-            self.current_genome_idx = 0
-            self.species = []
-            self.innovation_tracker.reset(self.num_inputs, self.num_outputs)
-            return None
-
-        # ... (The rest of your detailed speciation, shared fitness, elitism, crossover, mutation logic) ...
-        # This part is complex and largely remains the same as your previous neat_agent.py's learn method.
-        # Ensure it uses self.innovation_tracker via self.agent_ref in child genomes and for mutations.
-        # Calculate shared fitness
-        total_adjusted_fitness_sum = 0
-        for s in self.species: s.calculate_shared_fitness(); total_adjusted_fitness_sum += sum(m.adjusted_fitness for m in s.members)
-        if total_adjusted_fitness_sum == 0: total_adjusted_fitness_sum = 1e-6
-
-        new_population = []
-        # Elitism from best species
-        self.species.sort(key=lambda s: s.get_average_fitness(), reverse=True)
-        num_elite_species_champs = max(1, int(len(self.species) * self.elitism_species_percent))
-        for i in range(min(num_elite_species_champs, len(self.species))):
-            s = self.species[i]
-            if s.members and len(s.members) >= self.min_species_size_for_champion:
-                champ = s.get_champion()
-                if champ and len(new_population) < self.population_size: new_population.append(champ.clone())
+        if model_path_to_load and os.path.exists(model_path_to_load):
+            print(f"  Loading best NEAT genome from: {model_path_to_load}")
+            self.load(model_path_to_load) # This should load self.best_genome_overall
+        elif model_path_to_load:
+             print(f"  Warning: NEAT test model path '{model_path_to_load}' not found.")
         
-        # Offspring
-        num_offspring_needed = self.population_size - len(new_population)
-        spawn_counts = []
-        for s in self.species:
-            if s.members and total_adjusted_fitness_sum > 0: # Check total_adjusted_fitness_sum
-                 species_adj_fit_sum = sum(m.adjusted_fitness for m in s.members)
-                 spawns = math.floor(species_adj_fit_sum / total_adjusted_fitness_sum * num_offspring_needed)
-                 spawn_counts.append(spawns)
-            else: spawn_counts.append(0)
+        if self.best_genome_overall is None:
+            print("  Error: No best NEAT genome loaded or found for testing. Cannot proceed.")
+            return
+
+        self.active_net = neat.nn.FeedForwardNetwork.create(self.best_genome_overall, self.neat_config)
+        print(f"  Testing with best genome ID {self.best_genome_overall.key}, Fitness: {getattr(self.best_genome_overall, 'fitness', 'N/A'):.2f}")
+
+        test_env_render_mode = "human" if render_during_test else "rgb_array"
+        test_env = gym.make(self.env_id, render_mode=test_env_render_mode, full_action_space=False)
+        if record_video_flag:
+            ts = time.strftime("%Y%m%d_%H%M%S")
+            video_folder = os.path.join(self.gifs_dir if self.gifs_dir else "videos", f"neat_test_{ts}")
+            test_env = RecordVideo(test_env, video_folder=video_folder, name_prefix=f"neat_test_run",
+                                   episode_trigger=lambda ep_id: True, fps=video_fps)
+        test_env = RecordEpisodeStatistics(test_env)
+
+        all_rewards = []
+        for i in range(episodes):
+            obs, info = test_env.reset()
+            current_obs_p_flat = preprocess_observation_neat(obs, flatten=True)
+            episode_reward, current_steps = 0, 0
+            for _ in range(max_steps_per_episode):
+                action = self.choose_action(current_obs_p_flat)
+                next_obs_raw, reward, terminated, truncated, info = test_env.step(action)
+                episode_reward += reward
+                current_obs_p_flat = preprocess_observation_neat(next_obs_raw, flatten=True)
+                current_steps +=1
+                if render_during_test and test_env_render_mode=="human" and not record_video_flag: test_env.render()
+                if terminated or truncated: break
+            actual_ep_reward = info.get('episode', {}).get('r', episode_reward)
+            all_rewards.append(actual_ep_reward)
+            print(f"  NEAT Test Episode {i+1}/{episodes} - Score: {actual_ep_reward:.0f}, Steps: {current_steps}")
         
-        # Distribute remaining due to floor
-        current_total_spawns = sum(spawn_counts)
-        s_idx_distribute = 0
-        while current_total_spawns < num_offspring_needed and any(s.members for s in self.species):
-            species_for_extra_spawn = self.species[s_idx_distribute % len(self.species)]
-            if species_for_extra_spawn.members: # Only add to non-empty species
-                 spawn_counts[s_idx_distribute % len(self.species)] +=1
-                 current_total_spawns +=1
-            s_idx_distribute +=1
-            if s_idx_distribute > 2 * len(self.species) and current_total_spawns < num_offspring_needed: # Safety break
-                break 
+        test_env.close()
+        avg_r = np.mean(all_rewards) if all_rewards else 0
+        std_r = np.std(all_rewards) if all_rewards else 0
+        print(f"\n  NEAT Test Summary: Avg Score: {avg_r:.2f} +/- {std_r:.2f}")
+        print(f"--- NEAT Testing Ended ---")
 
+    def evaluate(self, model_path_to_load, episodes, max_steps_per_episode, **kwargs):
+        print(f"\n--- NEAT Evaluation ---")
+        if model_path_to_load and os.path.exists(model_path_to_load):
+            self.load(model_path_to_load)
+        elif model_path_to_load:
+            print(f"  Warning: NEAT eval model path '{model_path_to_load}' not found.")
 
-        for i, s in enumerate(self.species):
-            if not s.members or spawn_counts[i] == 0: continue
-            s.sort_members_by_fitness()
-            num_elites_this_species = max(0,int(len(s.members) * self.elitism_genome_percent_in_species)) # Can be 0 if small species
-            
-            # Add elites from this species (if not already added by top species elitism, and if distinct)
-            for j in range(min(num_elites_this_species, len(s.members))):
-                elite_genome = s.members[j]
-                # Avoid adding exact same elite if already added from top species elitism
-                # This check is tricky if clones are involved. Simple check:
-                already_added = any(new_pop_genome.fitness == elite_genome.fitness and 
-                                    compatibility_distance(new_pop_genome, elite_genome, self) < 0.1 
-                                    for new_pop_genome in new_population)
-                if len(new_population) < self.population_size and not already_added:
-                    new_population.append(elite_genome.clone())
-
-            # Reproduce for remaining spawn count for this species
-            num_to_reproduce = spawn_counts[i] - (len(new_population) - (self.population_size - num_offspring_needed - current_total_spawns + sum(spawn_counts[:i+1]) )) # Complex to track exact elites added
-            # Simpler: num_to_reproduce = spawn_counts[i] - number_of_elites_added_from_this_species_in_this_step
-            # For now, just fill up to spawn_counts[i] for this species in total (elites + offspring)
-            
-            current_pop_len_before_repro = len(new_population)
-            for _ in range(spawn_counts[i]): # This species needs to contribute spawn_counts[i] individuals total
-                if len(new_population) >= self.population_size: break
-                if not s.members: break # Safety if species became empty during elite selection
-
-                parent1 = random.choice(s.members) # Simplified selection
-                child = None
-                if np.random.rand() < self.interspecies_mate_rate and len(self.species) > 1:
-                    other_species_list = [sp for sp_idx, sp in enumerate(self.species) if sp_idx != i and sp.members]
-                    if other_species_list:
-                        parent2 = random.choice(random.choice(other_species_list).members)
-                    else: parent2 = random.choice(s.members) # Fallback
-                else: parent2 = random.choice(s.members)
-
-                if np.random.rand() < self.crossover_rate: child = crossover_neat(parent1, parent2, self)
-                else: child = random.choice([parent1, parent2]).clone() # Or just parent1.clone()
-                
-                child.agent_ref = self # Critical: ensure child has ref to NEATAgent for mutation
-                child.mutate()
-                new_population.append(child)
+        if self.best_genome_overall is None:
+            print("  Error: No best NEAT genome available for evaluation.")
+            return {}
         
-        while len(new_population) < self.population_size:
-            new_population.append(GenomeNEAT(self.num_inputs, self.num_outputs, agent_ref=self)) # Fill with new random
+        self.active_net = neat.nn.FeedForwardNetwork.create(self.best_genome_overall, self.neat_config)
+        print(f"  Evaluating with best genome ID {self.best_genome_overall.key}, Fitness: {getattr(self.best_genome_overall, 'fitness', 'N/A'):.2f}")
 
-        self.population = new_population[:self.population_size]
-        self.current_genome_idx = 0 # Reset for next generation's fitness evaluation cycle
+        eval_env = gym.make(self.env_id, render_mode="rgb_array", full_action_space=False)
+        eval_env = RecordEpisodeStatistics(eval_env)
+        all_ep_rewards, all_ep_steps = [], []
 
-        surviving_species = [] # Stagnation check
-        for s in self.species:
-            s.members = [g for g in self.population if g.species_id == s.id] # Re-assign members based on full new pop
-            if not s.members: continue # Skip if no members assigned in new pop
-            if s.check_stagnation():
-                # print_f(f"  Species {s.id} removed (stagnation).") # train.py can print this
-                pass
-            else:
-                if s.members : s.representative = random.choice(s.members).clone() # Update representative
-                surviving_species.append(s)
-        self.species = surviving_species
-        return None
+        for i in range(episodes):
+            obs, info = eval_env.reset()
+            current_obs_p_flat = preprocess_observation_neat(obs, flatten=True)
+            ep_r, ep_s = 0, 0
+            for _ in range(max_steps_per_episode):
+                action = self.choose_action(current_obs_p_flat)
+                next_obs_raw, reward, terminated, truncated, info = eval_env.step(action)
+                ep_r += reward; ep_s += 1
+                current_obs_p_flat = preprocess_observation_neat(next_obs_raw, flatten=True)
+                if terminated or truncated: break
+            actual_ep_reward = info.get('episode', {}).get('r', ep_r)
+            actual_ep_steps = info.get('episode', {}).get('l', ep_s)
+            all_ep_rewards.append(actual_ep_reward)
+            all_ep_steps.append(actual_ep_steps)
+            if (i + 1) % max(1, episodes // 5) == 0:
+                 print(f"    NEAT Eval Ep {i+1}/{episodes}: Score={actual_ep_reward:.0f}, Steps={actual_ep_steps}")
+        eval_env.close()
 
-    def _speciate_population(self): # Uses self.compatibility_threshold, self.innovation_tracker
-        for s in self.species: s.members = []
-        for genome in self.population:
-            placed = False
-            for s in self.species:
-                if compatibility_distance(genome, s.representative, self) < self.compatibility_threshold:
-                    s.add_member(genome); placed = True; break
-            if not placed:
-                self.species.append(SpeciesNEAT(genome, len(self.species), self))
-        self.species = [s for s in self.species if s.members]
+        results = {}
+        if all_ep_rewards:
+            results = {
+                "num_episodes_eval": episodes,
+                "avg_score": round(np.mean(all_ep_rewards), 2),
+                "std_dev_score": round(np.std(all_ep_rewards), 2),
+                "min_score": round(np.min(all_ep_rewards), 2),
+                "max_score": round(np.max(all_ep_rewards), 2),
+                "avg_steps": round(np.mean(all_ep_steps), 1)
+            }
+        print(f"--- NEAT Evaluation Ended ---")
+        return results
 
-    def save(self, path): # Saves best_genome_overall
-        if self.best_genome_overall:
+    def save(self, path_for_best_genome_pkl): # Path is for the .pkl best genome
+        # NEAT population checkpointing is handled by its own Checkpointer reporter
+        # This save method is primarily for saving the best genome found overall
+        if self.best_genome_overall is not None and path_for_best_genome_pkl:
+            os.makedirs(os.path.dirname(path_for_best_genome_pkl), exist_ok=True)
             try:
-                with open(path, 'wb') as f: pickle.dump(self.best_genome_overall, f)
-            except Exception as e: print(f"Error saving NEAT: {e}")
+                with open(path_for_best_genome_pkl, 'wb') as f:
+                    pickle.dump(self.best_genome_overall, f)
+                print(f"  Best NEAT genome saved to {os.path.basename(path_for_best_genome_pkl)}")
+            except Exception as e:
+                print(f"  Error saving best NEAT genome to {path_for_best_genome_pkl}: {e}")
+        elif not self.best_genome_overall:
+            print("  NEAT save attempt: No best_genome_overall to save.")
+        
+        # Note: The population itself is saved by neat.Checkpointer during `population.run()`
 
-    def load(self, path): # Loads a single genome and seeds population
-        # ... (logic as before, ensuring agent_ref is set and innovation_tracker is updated)
-        try:
-            with open(path, 'rb') as f: loaded_genome = pickle.load(f)
-            loaded_genome.agent_ref = self # VERY IMPORTANT
-            self.population = [loaded_genome.clone() for _ in range(self.population_size)]
-            self.best_genome_overall = loaded_genome.clone()
-            self.best_fitness_overall = loaded_genome.fitness
-            self.current_genome_idx, self.current_generation, self.species = 0, 0, []
-            max_conn_innov, max_node_id = -1, self.num_inputs + self.num_outputs -1
-            if loaded_genome.connection_genes: max_conn_innov = max(loaded_genome.connection_genes.keys() or [-1])
-            if loaded_genome.node_genes: max_node_id = max(loaded_genome.node_genes.keys() or [max_node_id])
-            self.innovation_tracker.reset(self.num_inputs, self.num_outputs) # Reset first
-            self.innovation_tracker.innovation_number = max_conn_innov + 1
-            self.innovation_tracker.node_innovation_count = max_node_id + 1
-            # Rebuild innovation history for loaded genome's connections/nodes
-            # This is complex. For simplicity, the above reset might lead to some innovation number reuse
-            # if evolution continues from a loaded genome AND new structures identical to old ones (from pre-load) are formed.
-            # A truly robust resume would save/load the innovation_tracker's state too.
-            print(f"NEAT: Loaded genome from {path} (Fit: {loaded_genome.fitness:.2f}). Population seeded.")
-            print(f"  Innovation reset: conn_next={self.innovation_tracker.innovation_number}, node_next={self.innovation_tracker.node_innovation_count}")
-        except Exception as e:
-            print(f"Error loading NEAT: {e}. New random population.")
-            self.population = [GenomeNEAT(self.num_inputs, self.num_outputs, agent_ref=self) for _ in range(self.population_size)]
+    def load(self, path_to_best_genome_pkl): # Path is for the .pkl best genome
+        # This method primarily loads the best_genome_overall.
+        # Population loading for resuming training is handled by neat.Checkpointer.restore_checkpoint
+        # in the train() method.
+        if path_to_best_genome_pkl and os.path.exists(path_to_best_genome_pkl):
+            try:
+                with open(path_to_best_genome_pkl, 'rb') as f:
+                    self.best_genome_overall = pickle.load(f)
+                print(f"  Best NEAT genome loaded from {os.path.basename(path_to_best_genome_pkl)}")
+                if self.best_genome_overall:
+                    # Prepare active_net if a best genome was loaded, for immediate test/eval
+                    self.active_net = neat.nn.FeedForwardNetwork.create(self.best_genome_overall, self.neat_config)
+            except Exception as e:
+                print(f"  Error loading best NEAT genome from {path_to_best_genome_pkl}: {e}")
+                self.best_genome_overall = None
+        elif path_to_best_genome_pkl:
+            print(f"  Load path for best NEAT genome does not exist: {path_to_best_genome_pkl}")
+
+        # For resuming training, main.py might pass a checkpoint path to train method,
+        # or train method can look for latest checkpoint.
+        # This load focuses on the best individual for testing/evaluation.

@@ -1,5 +1,18 @@
-pygame
+# --- START OF FILE requirements.txt ---
 numpy
 torch
 Pillow
-imageio
+matplotlib
+# imageio # Optional
+
+# Let Gymnasium and SB3 manage their ALE dependencies
+gymnasium[atari,accept-rom-license]>=0.29.0,<0.30.0 # Try latest 0.29 series
+stable-baselines3[extra]>=2.0.0
+neat-python
+# AutoROM and AutoROM.accept-rom-license are often pulled in by gymnasium's extras
+# but listing them can be a fallback if extras don't work as expected.
+# Try without them first if the gymnasium extra is robust.
+# If errors persist about ROMs, add them back:
+# AutoROM
+# AutoROM.accept-rom-license
+# --- END OF FILE requirements.txt ---

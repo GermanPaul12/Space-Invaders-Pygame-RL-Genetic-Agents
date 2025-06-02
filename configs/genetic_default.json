@@ -1,7 +1,8 @@
 {
-    "population_size": 20,
+    "population_size": 60,
     "mutation_rate": 0.1,
-    "mutation_strength": 0.1,
-    "crossover_rate": 0.7,
-    "num_elites": 2
+    "mutation_strength": 0.02,
+    "num_elites": 5,
+    "max_generations": 200,
+    "max_steps_per_eval": 2500
 }
